@@ -23,7 +23,13 @@ def train_model():
         return
 
     # 2. DataLoader 생성 (메모리에 있는 df를 그대로 전달)
-    train_loader, val_loader, le = get_dataloaders(train_df, test_df, batch_size=128)
+    train_loader, val_loader, le = get_dataloaders(
+    train_df, 
+    test_df, 
+    window_size=2048, 
+    step_size=1024,  # 50% Overlap
+    batch_size=64    # 윈도우가 커졌으니 VRAM 상황 봐서 조절 (3070이면 64~128 가능)
+    )
     num_classes = len(le.classes_)
 
     # 3. 모델 및 학습 설정
