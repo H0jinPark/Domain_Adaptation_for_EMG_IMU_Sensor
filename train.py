@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+from utils.visualizer import save_history_plot
 
 # 파일에서 함수 직접 불러오기
 from data_preprocess import preprocess_single_file 
@@ -42,22 +43,53 @@ def train_model():
     history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
 
     for epoch in range(num_epochs):
-        model.train()
-        train_loss, train_correct = 0, 0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
-        
-        for inputs, labels in pbar:
-            inputs, labels = inputs.to(device), labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+            # --- [1. Training Phase] ---
+            model.train()
+            train_loss, train_correct = 0, 0
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")
             
-            train_loss += loss.item() * inputs.size(0)
-            _, preds = torch.max(outputs, 1)
-            train_correct += torch.sum(preds == labels.data)
-            pbar.set_postfix({'loss': loss.item()})
+            for inputs, labels in pbar:
+                inputs, labels = inputs.to(device), labels.to(device)
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+                
+                train_loss += loss.item() * inputs.size(0)
+                _, preds = torch.max(outputs, 1)
+                train_correct += torch.sum(preds == labels.data)
+                pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+
+            # --- [2. Validation Phase] ---
+            model.eval()
+            val_loss, val_correct = 0, 0
+            with torch.no_grad():
+                for inputs, labels in val_loader:
+                    inputs, labels = inputs.to(device), labels.to(device)
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+                    
+                    val_loss += loss.item() * inputs.size(0)
+                    _, preds = torch.max(outputs, 1)
+                    val_correct += torch.sum(preds == labels.data)
+
+            # --- [3. 에포크 결과 계산 및 기록] ---
+            epoch_train_loss = train_loss / len(train_loader.dataset)
+            epoch_train_acc = train_correct.cpu().item() / len(train_loader.dataset)
+            epoch_val_loss = val_loss / len(val_loader.dataset)
+            epoch_val_acc = val_correct.cpu().item() / len(val_loader.dataset)
+
+            history['train_loss'].append(epoch_train_loss)
+            history['train_acc'].append(epoch_train_acc)
+            history['val_loss'].append(epoch_val_loss)
+            history['val_acc'].append(epoch_val_acc)
+
+            # --- [4. 에포크마다 정확도 출력] ---
+            print(f"\n📊 Epoch [{epoch+1}/{num_epochs}] Summary:")
+            print(f"   [Train] Loss: {epoch_train_loss:.4f} | Acc: {epoch_train_acc*100:.2f}%")
+            print(f"   [Val]   Loss: {epoch_val_loss:.4f} | Acc: {epoch_val_acc*100:.2f}%")
+            print("-" * 40)
 
         # 검증 루프 및 결과 기록 (생략 가능하지만 흐름상 유지)
     print("\n" + "="*30)    
