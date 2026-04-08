@@ -4,33 +4,30 @@ from sklearn.model_selection import train_test_split
 
 def preprocess_single_file(file_path, test_size=0.2, random_state=42):
     """
-    단일 Parquet 파일을 불러와 EMG/IMU 데이터를 묶고 8:2로 분할합니다.
+    Parquet 파일을 로드하고, EMG/IMU 데이터를 구분하여 8:2로 분할합니다.
     """
-    # 1. Parquet 데이터 로드
-    print(f"📂 {file_path} 로드 중 (Parquet)...")
+    # 1. 데이터 로드
+    print(f"📂 {file_path} 로드 중...")
     data = pd.read_parquet(file_path)
 
-    # 2. EMG와 IMU 열(Column) 이름 추출
-    # (RMS 제외 순수 신호만 선택)
+    # 2. 컬럼 정의 (이 부분은 호진님의 데이터 컬럼명에 맞춰 자동 추출됩니다)
+    # RMS를 제외한 순수 EMG 신호만 선택
     emg_cols = [col for col in data.columns if col.startswith('EMG_') and 'RMS' not in col]
     imu_cols = [col for col in data.columns if col.startswith('IMU_')]
 
-    print(f"✅ 추출된 EMG 채널: {len(emg_cols)}개")
-    print(f"✅ 추출된 IMU 채널: {len(imu_cols)}개")
+    print(f"✅ 추출 완료 - EMG: {len(emg_cols)}채널, IMU: {len(imu_cols)}채널")
 
-    # 3. 파일(동작) 단위로 데이터 묶기 (Stacking)
+    # 3. 그룹화 및 배열 변환
     filenames, emg_arrays, imu_arrays, labels = [], [], [], []
     
-    # 'filename' 기준으로 그룹화하여 시계열 윈도우 생성
     grouped = data.groupby('filename')
-    print(f"🔥 {len(grouped)}개의 동작 파일 묶기 시작...")
+    print(f"🔥 {len(grouped)}개의 동작 데이터 변환 시작...")
     
     for file_name, group in grouped:
-        # 각 동작을 (시간, 채널) 형태의 Numpy 배열로 변환
-        emg_matrix = group[emg_cols].values
-        imu_matrix = group[imu_cols].values
+        # float32로 변환하여 메모리 효율성 증대 (RTX 3070 학습 속도 향상)
+        emg_matrix = group[emg_cols].values.astype(np.float32)
+        imu_matrix = group[imu_cols].values.astype(np.float32)
         
-        # 라벨(exercise) 추출
         label = group['exercise'].iloc[0]
         
         filenames.append(file_name)
@@ -38,18 +35,15 @@ def preprocess_single_file(file_path, test_size=0.2, random_state=42):
         imu_arrays.append(imu_matrix)
         labels.append(label)
 
-    # 4. 딥러닝용 데이터프레임 구성
+    # 4. 학습용 데이터프레임 구성
     df_dl_ready = pd.DataFrame({
         'filename': filenames,
         'emg_data': emg_arrays,
-        'imu_data': imu_arrays,
+        'imu_data': imu_arrays, # 일단 가지고는 있습니다!
         'label': labels
     })
 
-    # 5. Stratified Split (8:2)
-    # 클래스(label) 비율을 유지하며 나눕니다.
-    print(f"✂️ 데이터를 {1-test_size}:{test_size} 비율로 분할 중...")
-    
+    # 5. Stratified Split (클래스 비율 유지)
     train_df, test_df = train_test_split(
         df_dl_ready, 
         test_size=test_size, 
@@ -57,9 +51,7 @@ def preprocess_single_file(file_path, test_size=0.2, random_state=42):
         stratify=df_dl_ready['label']
     )
 
-    print(f"📊 분할 결과:")
-    print(f" - Train 세트: {len(train_df)} samples")
-    print(f" - Test 세트: {len(test_df)} samples")
+    print(f"📊 최종 결과: Train {len(train_df)} / Test {len(test_df)}")
     
     return train_df, test_df
 
