@@ -28,12 +28,12 @@ def train_cl_model():
     # 2-1. 학습 및 검증 로더
     train_loader, val_loader, le = get_dataloaders(
         train_df, val_df, 
-        window_size=2048, step_size=1024, batch_size=256, mode='both'
+        window_size=2048, step_size=1024, batch_size=64, mode='both'
     )
     # 2-2. 최종 평가용 테스트 로더
     _, test_loader, _ = get_dataloaders(
         train_df, test_df, 
-        window_size=2048, step_size=1024, batch_size=256, mode='both'
+        window_size=2048, step_size=1024, batch_size=64, mode='both'
     )
     
     num_classes = len(le.classes_)
@@ -54,12 +54,12 @@ def train_cl_model():
     }
 
     # IMU 뇌사(Freeze) 및 EMG 얼리스토핑 설정
-    imu_patience_limit = 20
+    imu_patience_limit = 10
     imu_patience_counter = 0
     best_val_imu_acc = 0.0
     is_imu_frozen = False 
 
-    emg_patience_limit = 20
+    emg_patience_limit = 30
     emg_patience_counter = 0
     best_val_emg_acc = 0.0
     best_model_path = "best_cl_model_cross_subject.pth"
@@ -166,20 +166,20 @@ def train_cl_model():
             all_labels.extend(labels.cpu().numpy())
 
     # 결과 리포트 및 시각화
-    print("\n📝 [최종 논문용 CL 분류 보고서 (Test Set)]")
+    print("\n📝 [CL 분류 보고서 (Test Set)]")
     print(classification_report(all_labels, all_preds, target_names=le.classes_))
 
     plt.figure(figsize=(10, 8))
     cm = confusion_matrix(all_labels, all_preds)
     sns.heatmap(cm, annot=True, fmt='d', xticklabels=le.classes_, yticklabels=le.classes_, cmap='Blues')
-    plt.title('CL Model - Cross Subject Test Result', fontsize=14, fontweight='bold')
+    plt.title('CL Model - Test Result', fontsize=14, fontweight='bold')
     plt.xlabel('Predicted (EMG Only)', fontsize=12); plt.ylabel('Actual', fontsize=12)
     plt.tight_layout()
-    plt.savefig('results/cl_cross_subject_cm.png', dpi=300)
+    plt.savefig('results/cl_cm.png', dpi=300)
     
     save_history_plot({'train_loss': history['train_loss'], 'val_loss': history['val_loss'], 
                        'train_acc': history['train_emg_acc'], 'val_acc': history['val_emg_acc']}, 
-                      save_path='results/cl_cross_subject_history.png')
+                      save_path='results/cl_history.png')
     print("✅ 모든 실험 결과 저장 완료!")
 
 if __name__ == "__main__":

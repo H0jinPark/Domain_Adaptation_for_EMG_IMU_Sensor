@@ -31,7 +31,7 @@ def train_model():
         val_df, 
         window_size=2048, 
         step_size=1024,  
-        batch_size=256,  
+        batch_size=64,  
         mode='emg_only'  
     )
     # 2-2. 최종 평가용 테스트 로더 (Shuffle 없이 생성)
@@ -40,7 +40,7 @@ def train_model():
         test_df, 
         window_size=2048, 
         step_size=1024,  
-        batch_size=256,  
+        batch_size=64,  
         mode='emg_only'
     )
     
@@ -148,19 +148,19 @@ def train_model():
             all_labels.extend(labels.cpu().numpy())
 
     # 7. 결과 출력 및 저장
-    print("\n📝 [최종 논문용 분류 보고서 (Test Set)]")
+    print("\n📝 [BaseLine 분류 보고서 (Test Set)]")
     print(classification_report(all_labels, all_preds, target_names=le.classes_))
 
     plt.figure(figsize=(10, 8))
     cm = confusion_matrix(all_labels, all_preds)
     sns.heatmap(cm, annot=True, fmt='d', xticklabels=le.classes_, yticklabels=le.classes_, cmap='Blues')
-    plt.title('EMG Baseline - Cross Subject Test Result', fontsize=14)
+    plt.title('EMG Baseline - Test Result', fontsize=14)
     plt.xlabel('Predicted')
     plt.ylabel('Actual')
     plt.tight_layout()
-    plt.savefig('baseline_cross_subject_cm.png', dpi=300)
+    plt.savefig('results/baseline_cm.png', dpi=300)
     
-    save_history_plot(history, save_path='baseline_training_history.png')
+    save_history_plot(history, save_path='results/baseline_training_history.png')
     print("🎨 혼동 행렬 및 학습 곡선 저장 완료!")
 
 if __name__ == "__main__":
