@@ -26,7 +26,7 @@ def train_dann():
     
     os.makedirs('weights', exist_ok=True)
     os.makedirs('results', exist_ok=True)
-    save_path = 'weights/dann_best_model.pth'
+    save_path = 'weights/dann_SDA_best_model.pth'
 
     # 🌟 데이터 로더 (4분할 구조로 호출)
     train_loader, val_loader, tgt_train_loader, tgt_val_loader, num_classes, le = get_dataloaders(batch_size=BATCH_SIZE)
@@ -87,13 +87,11 @@ def train_dann():
             tgt_class_out, tgt_domain_out = model(tgt_x, alpha=alpha)
             
             loss_t_domain = criterion_domain(tgt_domain_out, tgt_domain_label)
-            #SDA
-            # loss_t_label = criterion_class(tgt_class_out, tgt_y) 
+            loss_t_label = criterion_class(tgt_class_out, tgt_y) 
             
             # --- [Step 3] 통합 손실 계산 및 역전파 ---
             domain_loss = loss_s_domain + loss_t_domain
-            # class_loss = loss_s_label + loss_t_label
-            class_loss = loss_s_label
+            class_loss = loss_s_label + loss_t_label
             
             loss = class_loss + domain_loss
             loss.backward()
@@ -176,7 +174,7 @@ def train_dann():
     plt.ylabel('True Label', fontsize=12)
     plt.xticks(rotation=45)
     plt.tight_layout()
-    plt.savefig('results/dann_source_confusion_matrix.png', dpi=300)
+    plt.savefig('results/dann_SDA_source_confusion_matrix.png', dpi=300)
     plt.close()
 
     # --- Target Domain (Unseen Validation) Confusion Matrix ---
@@ -197,7 +195,7 @@ def train_dann():
     plt.ylabel('True Label', fontsize=12)
     plt.xticks(rotation=45)
     plt.tight_layout()
-    plt.savefig('results/dann_target_confusion_matrix.png', dpi=300)
+    plt.savefig('results/dann_SDA_target_confusion_matrix.png', dpi=300)
     print("📊 혼동 행렬 시각화가 모두 저장되었습니다.")
     plt.show()
 

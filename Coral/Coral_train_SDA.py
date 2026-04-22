@@ -67,7 +67,7 @@ def train_coral():
     print(f"🔥 CORAL Training Start! Using device: {DEVICE}")
     os.makedirs('weights', exist_ok=True)
     os.makedirs('results', exist_ok=True)
-    save_path = 'weights/coral_best_model.pth'
+    save_path = 'weights/coral_SDA_best_model.pth'
 
     # 🌟 데이터 로더 (4분할 구조로 호출)
     train_loader, val_loader, tgt_train_loader, tgt_val_loader, num_classes, le = get_dataloaders(batch_size=BATCH_SIZE)
@@ -109,10 +109,43 @@ def train_coral():
             src_out, src_feat = model(src_x)
             tgt_out, tgt_feat = model(tgt_x)
             
+            # 2. 분류 손실 (SDA: 두 도메인 모두 라벨 손실 계산)
             loss_cls_src = criterion(src_out, src_y)
-            loss_cls = loss_cls_src
-            loss_coral = coral_loss(src_feat, tgt_feat)
-            total_loss = loss_cls + LAMBDA_CORAL * loss_coral
+            loss_cls_tgt = criterion(tgt_out, tgt_y)
+            # SDA
+            loss_cls = loss_cls_src + loss_cls_tgt
+            # UDA
+            # loss_cls = loss_cls_src
+
+            # 3. Class-wise CORAL Loss
+            batch_class_coral = 0.0
+            count_classes = 0
+            
+            # 배치 내에 존재하는 고유한 라벨들 확인
+            unique_classes = torch.unique(src_y) 
+            
+            for cls in unique_classes:
+                # 해당 클래스에 해당하는 데이터만 필터링 (Masking)
+                src_mask = (src_y == cls)
+                tgt_mask = (tgt_y == cls)
+                
+                # 소스와 타겟 모두에 해당 클래스 데이터가 2개 이상 있어야 공분산 계산 가능
+                if src_mask.sum() > 1 and tgt_mask.sum() > 1:
+                    s_cls_feat = src_feat[src_mask]
+                    t_cls_feat = tgt_feat[tgt_mask]
+                    
+                    # 같은 클래스끼리만 통계적 분포를 맞춤! (Semantic Alignment)
+                    batch_class_coral += coral_loss(s_cls_feat, t_cls_feat)
+                    count_classes += 1
+            
+            # 유효한 클래스가 있었다면 평균 내기, 없으면 Global CORAL로 백업
+            if count_classes > 0:
+                loss_coral = batch_class_coral / count_classes
+            else:
+                loss_coral = coral_loss(src_feat, tgt_feat)
+            
+            # 4. 전체 손실 역전파
+            total_loss = loss_cls + (LAMBDA_CORAL * loss_coral)
             
             total_loss.backward()
             optimizer.step()
@@ -179,11 +212,11 @@ def train_coral():
     cm_val = confusion_matrix(v_true_final, v_preds_final)
     plt.figure(figsize=(12, 10))
     sns.heatmap(cm_val, annot=True, fmt='d', cmap='Greens', xticklabels=class_names, yticklabels=class_names)
-    plt.title(f'CORAL (UDA) Source Prediction\n(Val Acc: {best_val_acc:.1f}%)')
+    plt.title(f'CORAL (SDA) Source Prediction\n(Val Acc: {best_val_acc:.1f}%)')
     plt.ylabel('True Label')
     plt.xlabel('Predicted Label')
     plt.tight_layout()
-    plt.savefig('results/coral_source_confusion_matrix.png', dpi=300)
+    plt.savefig('results/coral_SDA_source_confusion_matrix.png', dpi=300)
     plt.close() # 메모리 관리를 위해 창 닫기
 
     # 2. Target Domain (Unseen Validation) 시각화
@@ -199,11 +232,11 @@ def train_coral():
     cm_tgt = confusion_matrix(t_true_final, t_preds_final)
     plt.figure(figsize=(12, 10))
     sns.heatmap(cm_tgt, annot=True, fmt='d', cmap='Greens', xticklabels=class_names, yticklabels=class_names)
-    plt.title(f'CORAL (UDA) Target Prediction\n(Source Val: {best_val_acc:.1f}% vs Target Val: {best_target_acc:.1f}%)')
+    plt.title(f'CORAL (SDA) Target Prediction\n(Source Val: {best_val_acc:.1f}% vs Target Val: {best_target_acc:.1f}%)')
     plt.ylabel('True Label')
     plt.xlabel('Predicted Label')
     plt.tight_layout()
-    plt.savefig('results/coral_target_confusion_matrix.png', dpi=300)
+    plt.savefig('results/coral_SDA_target_confusion_matrix.png', dpi=300)
     plt.show()
 
 if __name__ == "__main__":
