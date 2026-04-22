@@ -1,6 +1,6 @@
 # Cross-Device Domain Adaptation for Wearable Sensor Data
 
-본 프로젝트는 **EMG + IMU 센서 기반 운동 분류 문제**에서 **디바이스 간 domain shift를 극복하기 위한 domain adaptation 방법론**을 비교합니다.
+본 프로젝트는 **EMG + IMU 센서 기반 운동 분류 문제**에서 **디바이스 간 domain shift를 극복하기 위한 domain adaptation 방법론**을 비교.
 
 ### 비교 대상
 - **Baseline** (No Adaptation)
@@ -54,7 +54,7 @@ DOMAIN_ADAPTATION/
 
 ## 📦 Data Format
 
-데이터는 아래 컬럼을 포함하면 사용 가능합니다:
+데이터는 아래 컬럼을 포함하면 사용 가능:
 
 | 센서 | 컬럼명 |
 |------|--------|
@@ -82,13 +82,13 @@ python data_preprocess.py
    - Source: samsung1 (train/validation)
    - Target: samsung2 (train/validation)
 
-👉 **전처리 결과는 `preprocessed/` 폴더에 저장됩니다.**
+👉 **전처리 결과는 `preprocessed/` 폴더에 저장.**
 
 ---
 
 ## 🚀 Training
 
-세 가지 모델을 각각 실행할 수 있습니다.
+세 가지 모델을 각각 실행할 수 있음.
 
 ### 1️⃣ Baseline
 ```bash
@@ -109,14 +109,14 @@ python DANN/DANN_train.py
 
 ## 📈 Results
 
-- 결과는 `results/` 폴더에 저장됩니다.
-- 각 모델은 **Confusion Matrix 이미지**를 생성합니다.
+- 결과는 `results/` 폴더에 저장.
+- 각 모델은 **Confusion Matrix 이미지**를 생성.
 
 ---
 
 ## 🔍 Inference & Visualization
 
-직관적인 결과 확인은 다음 notebook에서 가능합니다:
+직관적인 결과 확인은 다음 notebook에서 가능:
 
 📓 **`inference.ipynb`**
 
@@ -205,9 +205,9 @@ Label Classifier   Domain Classifier
 
 ## ⚠️ Important Notes
 
-> ⚠️ **본 실험은 target train label을 사용하는 Supervised Domain Adaptation setting입니다.**
+> ⚠️ **본 실험은 target train label을 사용하는 Supervised Domain Adaptation setting임.**
 > 
-> 완전한 Unsupervised DA와는 다르므로 결과 해석 시 이 점을 반드시 고려해야 합니다.
+> 완전한 Unsupervised DA와는 다르므로 결과 해석 시 이 점을 반드시 고려해야함
 
 ---
 
