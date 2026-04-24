@@ -59,7 +59,7 @@ class CORALWrapper(nn.Module):
 # =====================================================================
 def train_coral():
     BATCH_SIZE = 64
-    EPOCHS = 20
+    EPOCHS = 30
     LEARNING_RATE = 1e-3
     LAMBDA_CORAL = 0.5 # CORAL 손실의 가중치 (실험하며 조정 필요)
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -108,7 +108,7 @@ def train_coral():
             # 1. 모델 피드포워드 (특징 추출 및 분류)
             src_out, src_feat = model(src_x)
             tgt_out, tgt_feat = model(tgt_x)
-            
+                        
             loss_cls_src = criterion(src_out, src_y)
             loss_cls = loss_cls_src
             loss_coral = coral_loss(src_feat, tgt_feat)

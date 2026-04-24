@@ -55,7 +55,6 @@ class DANNModel(nn.Module):
         )
         
         # [3] Domain Discriminator: Source인지 Target인지 맞추는 부분
-        # 특징 추출기가 이 녀석을 속여야 함!
         self.domain_classifier = nn.Sequential(
             nn.Linear(512, 256),
             nn.BatchNorm1d(256),
