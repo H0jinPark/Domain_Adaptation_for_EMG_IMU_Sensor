@@ -82,7 +82,7 @@ def train_mmd():
     os.makedirs("weights", exist_ok=True)
     os.makedirs("results", exist_ok=True)
 
-    save_path = "weights/mmd_best_model.pth"
+    save_path = "weights/mmd_best_source_model.pth"
 
     train_loader, val_loader, tgt_train_loader, tgt_val_loader, num_classes, le = get_dataloaders(
         batch_size=BATCH_SIZE
@@ -100,8 +100,9 @@ def train_mmd():
     print("📏 MMD Alignment Training Start!")
     print("=" * 50)
 
+    best_source_acc = 0.0
     best_target_acc = 0.0
-    best_val_acc = 0.0
+    best_epoch = 0
 
     for epoch in range(EPOCHS):
         model.train()
@@ -173,16 +174,18 @@ def train_mmd():
             f"Target Val: {tgt_acc:.2f}%"
         )
 
-        if tgt_acc > best_target_acc:
+        if val_acc > best_source_acc:
+            best_source_acc = val_acc
             best_target_acc = tgt_acc
-            best_val_acc = val_acc
+            best_epoch = epoch + 1
             torch.save(model.state_dict(), save_path)
-            print("   -> 🌟 Best Target Model Saved!")
+            print("   -> 🌟 Best Source Val Model Saved!")
 
     print(
         f"\n✅ 최종 결과 | "
-        f"Best Target Acc: {best_target_acc:.2f}% | "
-        f"Shift: {best_val_acc - best_target_acc:.2f}%"
+        f"Best Source Val Acc: {best_source_acc:.2f}% | "
+        f"Target Acc at Best Source: {best_target_acc:.2f}% | "
+        f"Shift: {best_source_acc - best_target_acc:.2f}%"
     )
 
     model.load_state_dict(torch.load(save_path, map_location=DEVICE))
@@ -199,6 +202,7 @@ def train_mmd():
             v_preds_final.extend(v_out.max(1)[1].cpu().numpy())
             v_true_final.extend(vy.numpy())
 
+    final_source_acc = accuracy_score(v_true_final, v_preds_final) * 100
     cm_val = confusion_matrix(v_true_final, v_preds_final)
 
     plt.figure(figsize=(12, 10))
@@ -210,7 +214,7 @@ def train_mmd():
         xticklabels=class_names,
         yticklabels=class_names
     )
-    plt.title(f"MMD (UDA) Source Prediction\n(Val Acc: {best_val_acc:.1f}%)")
+    plt.title(f"MMD (UDA) Source Prediction\n(Val Acc: {final_source_acc:.1f}%)")
     plt.ylabel("True Label")
     plt.xlabel("Predicted Label")
     plt.tight_layout()
@@ -228,6 +232,7 @@ def train_mmd():
             t_preds_final.extend(t_out.max(1)[1].cpu().numpy())
             t_true_final.extend(ty.numpy())
 
+    final_target_acc = accuracy_score(t_true_final, t_preds_final) * 100
     cm_tgt = confusion_matrix(t_true_final, t_preds_final)
 
     plt.figure(figsize=(12, 10))
@@ -241,7 +246,7 @@ def train_mmd():
     )
     plt.title(
         f"MMD (UDA) Target Prediction\n"
-        f"(Source Val: {best_val_acc:.1f}% vs Target Val: {best_target_acc:.1f}%)"
+        f"(Source Val: {final_source_acc:.1f}% vs Target Val: {final_target_acc:.1f}%)"
     )
     plt.ylabel("True Label")
     plt.xlabel("Predicted Label")

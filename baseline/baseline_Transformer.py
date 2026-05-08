@@ -22,7 +22,10 @@ class TransformerBaselineModel(nn.Module):
             nn.GELU()
         )
 
-        self.pos_embedding = nn.Parameter(torch.randn(1, max_len, embed_dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embedding = nn.Parameter(torch.zeros(1, max_len + 1, embed_dim))
+        nn.init.trunc_normal_(self.pos_embedding, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
@@ -39,9 +42,9 @@ class TransformerBaselineModel(nn.Module):
             num_layers=num_layers
         )
 
-        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.norm = nn.LayerNorm(embed_dim)
 
-        self.classifier = nn.Sequential(    
+        self.classifier = nn.Sequential(
             nn.Linear(embed_dim, 256),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -52,15 +55,19 @@ class TransformerBaselineModel(nn.Module):
         x = self.stem(x)
         x = x.transpose(1, 2)
 
-        seq_len = x.size(1)
-        x = x + self.pos_embedding[:, :seq_len, :]
+        b, seq_len, _ = x.shape
+
+        cls_token = self.cls_token.expand(b, -1, -1)
+        x = torch.cat([cls_token, x], dim=1)
+
+        x = x + self.pos_embedding[:, :seq_len + 1, :]
 
         x = self.transformer(x)
+        x = self.norm(x)
 
-        x = x.transpose(1, 2)
-        x = self.pool(x).squeeze(-1)
+        cls_feat = x[:, 0, :]
 
-        return self.classifier(x)
+        return self.classifier(cls_feat)
 
 
 if __name__ == "__main__":

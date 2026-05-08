@@ -147,8 +147,12 @@ def train_cdan():
     model.load_state_dict(torch.load(save_path, map_location=DEVICE))
     model.eval()
 
-    print(f"🚨 CDAN Target Domain 정확도: {best_target_acc:.2f}%")
-    print(f">> 최종 격차(Shift): {best_val_acc - best_target_acc:.2f}%")
+    print(
+        f"\n✅ 최종 결과 | "
+        f"Best Source Val Acc: {best_val_acc:.2f}% | "
+        f"Target Acc at Best Source: {best_target_acc:.2f}% | "
+        f"Shift: {best_val_acc - best_target_acc:.2f}%"
+    )
 
     print("\n📊 Saving Source Domain Confusion Matrix...")
 

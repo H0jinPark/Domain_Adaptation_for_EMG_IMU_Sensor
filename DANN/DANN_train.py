@@ -155,9 +155,12 @@ def train_dann():
     model.load_state_dict(torch.load(save_path))
     model.eval()
     
-    print(f"🚨 DANN Target Domain 정확도: {best_target_acc:.2f}%")
-    print(f">> 최종 격차(Shift): {best_val_acc - best_target_acc:.2f}%")
-
+    print(
+        f"\n✅ 최종 결과 | "
+        f"Best Source Val Acc: {best_val_acc:.2f}% | "
+        f"Target Acc at Best Source: {best_target_acc:.2f}% | "
+        f"Shift: {best_val_acc - best_target_acc:.2f}%"
+    )
     # --- Source Domain Confusion Matrix ---
     print("\n📊 Saving Source Domain Confusion Matrix...")
     v_preds_final, v_true_final = [], []
