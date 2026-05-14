@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.preprocessing import LabelEncoder
@@ -14,7 +15,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from DANN.DANN_MM_fusion_model import FusionDANN
+from DANN.DANN_MM_tcat_model import TemporalConcatDANN
 
 DATA_DIR = 'preprocessed_MM'
 
@@ -43,10 +44,10 @@ def load_split(prefix, le=None):
 
 
 def get_dataloaders(batch_size=64):
-    emg_tr, imu_tr, y_tr, le   = load_split('train')
-    emg_val, imu_val, y_val, _ = load_split('val',          le)
-    emg_tt, imu_tt, y_tt, _    = load_split('target_train', le)
-    emg_tv, imu_tv, y_tv, _    = load_split('target_val',   le)
+    emg_tr, imu_tr, y_tr, le       = load_split('train')
+    emg_val, imu_val, y_val, _     = load_split('val',          le)
+    emg_tt, imu_tt, y_tt, _        = load_split('target_train', le)
+    emg_tv, imu_tv, y_tv, _        = load_split('target_val',   le)
 
     print(f"Classes ({len(le.classes_)}): {le.classes_}")
     print(f"  Source  train={len(y_tr)}  val={len(y_val)}")
@@ -96,12 +97,12 @@ def save_confusion_matrix(labels, preds, class_names, path, title):
     plt.close()
 
 
-def train(seed=42, epochs=30, batch_size=64, lr=1e-3):
+def train(seed=42, epochs=30, batch_size=32, lr=1e-3, accum_steps=1):
     set_seed(seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\n{'='*60}")
-    print(f" DANN-MM Fusion Training  |  seed={seed}  device={device}")
-    print(f"{'='*60}")
+    print(f"\n{'='*55}")
+    print(f" DANN-MM-TCat Training  |  seed={seed}  device={device}")
+    print(f"{'='*55}")
 
     os.makedirs('weights', exist_ok=True)
     os.makedirs('results', exist_ok=True)
@@ -109,13 +110,14 @@ def train(seed=42, epochs=30, batch_size=64, lr=1e-3):
     src_loader, val_loader, tgt_loader, tgt_val_loader, le = get_dataloaders(batch_size)
     class_names = list(le.classes_)
     num_classes = len(class_names)
-    weight_path = f'weights/dann_mm_fusion_seed{seed}_best.pth'
+    weight_path = f'weights/dann_mm_tcat_seed{seed}_best.pth'
 
-    model         = FusionDANN(num_classes=num_classes).to(device)
+    model         = TemporalConcatDANN(num_classes=num_classes).to(device)
     criterion_cls = nn.CrossEntropyLoss(label_smoothing=0.1)
     criterion_dom = nn.CrossEntropyLoss()
     optimizer     = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
     scheduler     = CosineAnnealingLR(optimizer, T_max=epochs)
+    scaler        = GradScaler()
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f" Total params: {total_params:,}\n")
@@ -131,32 +133,44 @@ def train(seed=42, epochs=30, batch_size=64, lr=1e-3):
         src_iter = iter(src_loader)
         tgt_iter = iter(tgt_loader)
 
-        cls_sum = dom_sum = 0.0
+        cls_loss_sum = dom_loss_sum = 0.0
+        optimizer.zero_grad()
 
-        for _ in range(n_iter):
+        for step in range(n_iter):
             src_emg, src_imu, src_y = next(src_iter)
             tgt_emg, tgt_imu, _     = next(tgt_iter)
 
-            src_emg, src_imu, src_y = src_emg.to(device), src_imu.to(device), src_y.to(device)
-            tgt_emg, tgt_imu        = tgt_emg.to(device), tgt_imu.to(device)
+            src_emg = src_emg.to(device); src_imu = src_imu.to(device); src_y = src_y.to(device)
+            tgt_emg = tgt_emg.to(device); tgt_imu = tgt_imu.to(device)
 
-            src_dom = torch.zeros(src_emg.size(0), dtype=torch.long, device=device)
-            tgt_dom = torch.ones (tgt_emg.size(0), dtype=torch.long, device=device)
+            B_src = src_emg.size(0)
+            all_emg = torch.cat([src_emg, tgt_emg], dim=0)
+            all_imu = torch.cat([src_imu, tgt_imu], dim=0)
+            dom_labels = torch.cat([
+                torch.zeros(B_src,                dtype=torch.long, device=device),
+                torch.ones (tgt_emg.size(0),      dtype=torch.long, device=device),
+            ])
 
-            optimizer.zero_grad()
+            with autocast():
+                all_cls, all_dom = model(all_emg, all_imu, alpha)
+                src_cls     = all_cls[:B_src]
+                src_dom_out = all_dom[:B_src]
+                tgt_dom_out = all_dom[B_src:]
 
-            src_cls, src_dom_out = model(src_emg, src_imu, alpha)
-            _,       tgt_dom_out = model(tgt_emg, tgt_imu, alpha)
+                loss_cls = criterion_cls(src_cls, src_y)
+                loss_dom = (criterion_dom(src_dom_out, dom_labels[:B_src]) +
+                            criterion_dom(tgt_dom_out, dom_labels[B_src:]))
+                loss = (loss_cls + loss_dom) / accum_steps
 
-            loss_cls = criterion_cls(src_cls, src_y)
-            loss_dom = criterion_dom(src_dom_out, src_dom) + criterion_dom(tgt_dom_out, tgt_dom)
-            loss     = loss_cls + loss_dom
+            scaler.scale(loss).backward()
 
-            loss.backward()
-            optimizer.step()
+            if (step + 1) % accum_steps == 0 or (step + 1) == n_iter:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
 
-            cls_sum += loss_cls.item()
-            dom_sum += loss_dom.item()
+            cls_loss_sum += loss_cls.item()
+            dom_loss_sum += loss_dom.item()
 
         scheduler.step()
 
@@ -170,7 +184,7 @@ def train(seed=42, epochs=30, batch_size=64, lr=1e-3):
             flag = '  <- best'
 
         print(f"[{epoch:03d}/{epochs}] alpha={alpha:.3f}  "
-              f"cls={cls_sum/n_iter:.4f}  dom={dom_sum/n_iter:.4f}  "
+              f"cls={cls_loss_sum/n_iter:.4f}  dom={dom_loss_sum/n_iter:.4f}  "
               f"val={val_acc:.4f}  tgt={tgt_acc:.4f}{flag}")
 
     print(f"\n Best val acc: {best_val_acc:.4f}  (weights: {weight_path})")
@@ -183,36 +197,41 @@ def train(seed=42, epochs=30, batch_size=64, lr=1e-3):
     print(f" Final Target Acc : {tgt_acc:.4f}")
 
     save_confusion_matrix(src_labels, src_preds, class_names,
-                          f'results/dann_mm_fusion_seed{seed}_source_cm.png',
-                          f'DANN-MM Fusion Source (seed={seed}, acc={src_acc:.4f})')
+                          f'results/dann_mm_tcat_seed{seed}_source_cm.png',
+                          f'DANN-MM-TCat Source (seed={seed}, acc={src_acc:.4f})')
     save_confusion_matrix(tgt_labels, tgt_preds, class_names,
-                          f'results/dann_mm_fusion_seed{seed}_target_cm.png',
-                          f'DANN-MM Fusion Target (seed={seed}, acc={tgt_acc:.4f})')
+                          f'results/dann_mm_tcat_seed{seed}_target_cm.png',
+                          f'DANN-MM-TCat Target (seed={seed}, acc={tgt_acc:.4f})')
     return src_acc, tgt_acc
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--seed',       type=int,   default=42)
-    parser.add_argument('--multi_seed', action='store_true')
-    parser.add_argument('--seeds',      type=int,   nargs='+', default=[0, 1, 2, 3])
-    parser.add_argument('--epochs',     type=int,   default=30)
-    parser.add_argument('--batch_size', type=int,   default=64)
-    parser.add_argument('--lr',         type=float, default=1e-3)
+    parser.add_argument('--seed',        type=int,   default=42)
+    parser.add_argument('--multi_seed',  action='store_true')
+    parser.add_argument('--seeds',       type=int,   nargs='+', default=[0, 1, 2, 3, 4])
+    parser.add_argument('--epochs',      type=int,   default=30)
+    parser.add_argument('--batch_size',  type=int,   default=32)
+    parser.add_argument('--lr',          type=float, default=1e-3)
+    parser.add_argument('--accum_steps', type=int,   default=1,
+                        help='gradient accumulation steps (effective batch = batch_size * accum_steps)')
     args = parser.parse_args()
 
     if args.multi_seed:
         results = []
         for s in args.seeds:
             src_acc, tgt_acc = train(seed=s, epochs=args.epochs,
-                                     batch_size=args.batch_size, lr=args.lr)
+                                     batch_size=args.batch_size, lr=args.lr,
+                                     accum_steps=args.accum_steps)
             results.append((s, src_acc, tgt_acc))
-        print("\n" + "=" * 60)
+        print("\n" + "=" * 55)
         print(" Multi-seed Summary")
         print(f"{'Seed':>6}  {'Src Acc':>8}  {'Tgt Acc':>8}")
         for s, sa, ta in results:
             print(f"{s:>6}  {sa:>8.4f}  {ta:>8.4f}")
-        print(f"{'Mean':>6}  {np.mean([r[1] for r in results]):>8.4f}  {np.mean([r[2] for r in results]):>8.4f}")
+        print(f"{'Mean':>6}  {np.mean([r[1] for r in results]):>8.4f}  "
+              f"{np.mean([r[2] for r in results]):>8.4f}")
     else:
         train(seed=args.seed, epochs=args.epochs,
-              batch_size=args.batch_size, lr=args.lr)
+              batch_size=args.batch_size, lr=args.lr,
+              accum_steps=args.accum_steps)

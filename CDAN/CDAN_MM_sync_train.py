@@ -13,7 +13,7 @@ import seaborn as sns
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data_loader import get_dataloaders
-from DANN.DANN_MM_catten_model import ModalAttnDANN
+from CDAN.CDAN_MM_sync_model import SyncCDAN
 
 
 def set_seed(seed):
@@ -29,8 +29,8 @@ def evaluate(model, loader, device):
     preds, labels = [], []
     for x, y in loader:
         x = x.to(device)
-        out, _ = model(x, alpha=0.0)
-        preds.extend(out.argmax(1).cpu().numpy())
+        cls_out, _, _ = model(x, alpha=0.0)
+        preds.extend(cls_out.argmax(1).cpu().numpy())
         labels.extend(y.numpy())
     return accuracy_score(labels, preds), preds, labels
 
@@ -48,11 +48,11 @@ def save_confusion_matrix(labels, preds, class_names, path, title):
     plt.close()
 
 
-def train(seed=42, epochs=30, batch_size=64, lr=1e-3, d_per_ch=32, nhead=4):
+def train(seed=42, epochs=30, batch_size=64, lr=1e-3):
     set_seed(seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\n{'='*60}")
-    print(f" DANN-MM ChanAttn  |  seed={seed}  d_per_ch={d_per_ch}  nhead={nhead}  device={device}")
+    print(f" Sync CDAN Training  |  seed={seed}  device={device}")
     print(f"{'='*60}")
 
     os.makedirs('weights', exist_ok=True)
@@ -60,9 +60,9 @@ def train(seed=42, epochs=30, batch_size=64, lr=1e-3, d_per_ch=32, nhead=4):
 
     src_loader, val_loader, tgt_loader, tgt_val_loader, num_classes, le = get_dataloaders(batch_size)
     class_names = list(le.classes_)
-    weight_path = f'weights/dann_mm_catten_seed{seed}_best.pth'
+    weight_path = f'weights/cdan_mm_sync_seed{seed}_best.pth'
 
-    model         = ModalAttnDANN(num_classes=num_classes, d_per_ch=d_per_ch, nhead=nhead).to(device)
+    model         = SyncCDAN(num_classes=num_classes).to(device)
     criterion_cls = nn.CrossEntropyLoss(label_smoothing=0.1)
     criterion_dom = nn.CrossEntropyLoss()
     optimizer     = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
@@ -96,12 +96,14 @@ def train(seed=42, epochs=30, batch_size=64, lr=1e-3, d_per_ch=32, nhead=4):
 
             optimizer.zero_grad()
 
-            src_cls, src_dom_out = model(src_x, alpha)
-            _,       tgt_dom_out = model(tgt_x, alpha)
+            src_cls, src_dom_emg, src_dom_imu = model(src_x, alpha)
+            _,       tgt_dom_emg, tgt_dom_imu = model(tgt_x, alpha)
 
-            loss_cls = criterion_cls(src_cls, src_y)
-            loss_dom = criterion_dom(src_dom_out, src_dom) + criterion_dom(tgt_dom_out, tgt_dom)
-            loss     = loss_cls + loss_dom
+            loss_cls     = criterion_cls(src_cls, src_y)
+            loss_dom_emg = criterion_dom(src_dom_emg, src_dom) + criterion_dom(tgt_dom_emg, tgt_dom)
+            loss_dom_imu = criterion_dom(src_dom_imu, src_dom) + criterion_dom(tgt_dom_imu, tgt_dom)
+            loss_dom     = loss_dom_emg + loss_dom_imu
+            loss         = loss_cls + loss_dom
 
             loss.backward()
             optimizer.step()
@@ -134,11 +136,11 @@ def train(seed=42, epochs=30, batch_size=64, lr=1e-3, d_per_ch=32, nhead=4):
     print(f" Final Target Acc : {tgt_acc:.4f}")
 
     save_confusion_matrix(src_labels, src_preds, class_names,
-                          f'results/dann_mm_catten_seed{seed}_source_cm.png',
-                          f'DANN-MM ChanAttn Source (seed={seed}, acc={src_acc:.4f})')
+                          f'results/cdan_mm_sync_seed{seed}_source_cm.png',
+                          f'Sync CDAN Source (seed={seed}, acc={src_acc:.4f})')
     save_confusion_matrix(tgt_labels, tgt_preds, class_names,
-                          f'results/dann_mm_catten_seed{seed}_target_cm.png',
-                          f'DANN-MM ChanAttn Target (seed={seed}, acc={tgt_acc:.4f})')
+                          f'results/cdan_mm_sync_seed{seed}_target_cm.png',
+                          f'Sync CDAN Target (seed={seed}, acc={tgt_acc:.4f})')
     return src_acc, tgt_acc
 
 
@@ -150,15 +152,13 @@ if __name__ == "__main__":
     parser.add_argument('--epochs',     type=int,   default=30)
     parser.add_argument('--batch_size', type=int,   default=64)
     parser.add_argument('--lr',         type=float, default=1e-3)
-    parser.add_argument('--d_per_ch',   type=int,   default=32)
-    parser.add_argument('--nhead',      type=int,   default=4)
     args = parser.parse_args()
 
     if args.multi_seed:
         results = []
         for s in args.seeds:
-            src_acc, tgt_acc = train(seed=s, epochs=args.epochs, batch_size=args.batch_size,
-                                     lr=args.lr, d_per_ch=args.d_per_ch, nhead=args.nhead)
+            src_acc, tgt_acc = train(seed=s, epochs=args.epochs,
+                                     batch_size=args.batch_size, lr=args.lr)
             results.append((s, src_acc, tgt_acc))
         print("\n" + "=" * 60)
         print(" Multi-seed Summary")
@@ -167,5 +167,5 @@ if __name__ == "__main__":
             print(f"{s:>6}  {sa:>8.4f}  {ta:>8.4f}")
         print(f"{'Mean':>6}  {np.mean([r[1] for r in results]):>8.4f}  {np.mean([r[2] for r in results]):>8.4f}")
     else:
-        train(seed=args.seed, epochs=args.epochs, batch_size=args.batch_size,
-              lr=args.lr, d_per_ch=args.d_per_ch, nhead=args.nhead)
+        train(seed=args.seed, epochs=args.epochs,
+              batch_size=args.batch_size, lr=args.lr)
