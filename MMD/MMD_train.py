@@ -1,3 +1,8 @@
+"""MMD 학습 스크립트 (단일 백본, 5채널 동기화 입력).
+
+TCN baseline 백본의 feature 에 MMD 손실(gaussian-kernel maximum mean
+discrepancy)을 추가해 Source 라벨만으로 Target 운동 분류 성능을 끌어올린다.
+"""
 import os
 import sys
 import numpy as np
@@ -17,6 +22,7 @@ from baseline.baseline_model import AdvancedBaselineModel
 
 
 def gaussian_kernel(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
+    """Source/Target 샘플에 여러 bandwidth 의 가우시안 커널을 합산해 반환한다."""
     n_samples = int(source.size(0)) + int(target.size(0))
     total = torch.cat([source, target], dim=0)
 
@@ -38,6 +44,7 @@ def gaussian_kernel(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None
 
 
 def mmd_loss(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
+    """Source/Target feature 분포 간 maximum mean discrepancy 를 계산한다."""
     batch_size = int(source.size(0))
 
     kernels = gaussian_kernel(
@@ -58,6 +65,8 @@ def mmd_loss(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
 
 
 class MMDWrapper(nn.Module):
+    """baseline 백본을 감싸 (분류 logits, feature) 를 함께 반환한다."""
+
     def __init__(self, base_model):
         super(MMDWrapper, self).__init__()
         self.backbone = base_model
@@ -71,13 +80,16 @@ class MMDWrapper(nn.Module):
 
 
 def train_mmd():
+    # ----------------------------------------------------------------------
+    # 하이퍼파라미터 및 환경 설정
+    # ----------------------------------------------------------------------
     BATCH_SIZE = 64
     EPOCHS = 30
     LEARNING_RATE = 1e-3
     LAMBDA_MMD = 0.5
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print(f"🔥 MMD Training Start! Using device: {DEVICE}")
+    print(f"MMD Training Start | 디바이스: {DEVICE}")
 
     os.makedirs("weights", exist_ok=True)
     os.makedirs("results", exist_ok=True)
@@ -97,9 +109,12 @@ def train_mmd():
     scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
     print("\n" + "=" * 50)
-    print("📏 MMD Alignment Training Start!")
+    print("MMD Alignment Training Start")
     print("=" * 50)
 
+    # ----------------------------------------------------------------------
+    # 메인 학습 루프
+    # ----------------------------------------------------------------------
     best_source_acc = 0.0
     best_target_acc = 0.0
     best_epoch = 0
@@ -115,7 +130,7 @@ def train_mmd():
         pbar = tqdm(
             enumerate(data_zip),
             total=len_loader,
-            desc=f"Epoch [{epoch+1:02d}/{EPOCHS}]"
+            desc=f"Epoch [{epoch+1:02d}/{EPOCHS:02d}]"
         )
 
         for i, ((src_x, src_y), (tgt_x, tgt_y)) in pbar:
@@ -144,8 +159,10 @@ def train_mmd():
 
         scheduler.step()
 
+        # 검증 및 평가
         model.eval()
 
+        # Source validation 평가
         v_preds, v_targets = [], []
         with torch.no_grad():
             for vx, vy in val_loader:
@@ -156,6 +173,7 @@ def train_mmd():
 
         val_acc = accuracy_score(v_targets, v_preds) * 100
 
+        # Target validation 평가
         t_preds, t_targets = [], []
         with torch.no_grad():
             for tx, ty in tgt_val_loader:
@@ -166,35 +184,41 @@ def train_mmd():
 
         tgt_acc = accuracy_score(t_targets, t_preds) * 100
 
-        print(
-            f"Epoch [{epoch+1:02d}] | "
-            f"Loss: {running_loss / len_loader:.4f} | "
-            f"MMD: {running_mmd / len_loader:.4f} | "
-            f"Source Val: {val_acc:.2f}% | "
-            f"Target Val: {tgt_acc:.2f}%"
-        )
-
-        if val_acc > best_source_acc:
+        # Source val 기준 best 모델 저장
+        is_best = val_acc > best_source_acc
+        if is_best:
             best_source_acc = val_acc
             best_target_acc = tgt_acc
             best_epoch = epoch + 1
             torch.save(model.state_dict(), save_path)
-            print("   -> 🌟 Best Source Val Model Saved!")
+
+        best_mark = "  (best)" if is_best else ""
+        print(
+            f"Epoch [{epoch+1:02d}/{EPOCHS:02d}] | "
+            f"Loss: {running_loss / len_loader:.4f} | "
+            f"MMD: {running_mmd / len_loader:.4f} | "
+            f"Source Val: {val_acc:.2f}% | "
+            f"Target Val: {tgt_acc:.2f}%"
+            f"{best_mark}"
+        )
 
     print(
-        f"\n✅ 최종 결과 | "
+        f"\n최종 결과 | "
         f"Best Source Val Acc: {best_source_acc:.2f}% | "
         f"Target Acc at Best Source: {best_target_acc:.2f}% | "
         f"Shift: {best_source_acc - best_target_acc:.2f}%"
     )
 
+    # ----------------------------------------------------------------------
+    # 최종 결과 평가 및 시각화 저장
+    # ----------------------------------------------------------------------
     model.load_state_dict(torch.load(save_path, map_location=DEVICE))
     model.eval()
 
-    print("\n📊 Saving Source Domain Confusion Matrix...")
+    # Source 도메인 confusion matrix
+    print("\nSaving Source Domain Confusion Matrix...")
 
     v_preds_final, v_true_final = [], []
-
     with torch.no_grad():
         for vx, vy in val_loader:
             vx = vx.to(DEVICE)
@@ -221,10 +245,10 @@ def train_mmd():
     plt.savefig("results/mmd_source_confusion_matrix.png", dpi=300)
     plt.close()
 
-    print("🔍 Saving Target Domain Confusion Matrix...")
+    # Target 도메인 confusion matrix
+    print("Saving Target Domain Confusion Matrix...")
 
     t_preds_final, t_true_final = [], []
-
     with torch.no_grad():
         for tx, ty in tgt_val_loader:
             tx = tx.to(DEVICE)

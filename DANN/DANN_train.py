@@ -1,3 +1,9 @@
+"""DANN 학습 스크립트 (단일 백본, 5채널 동기화 입력).
+
+Gradient Reversal Layer 기반 adversarial domain adaptation 으로 Source(Samsung1)
+라벨만 사용해 Target(Samsung2) 운동 분류 성능을 끌어올린다. Source val 기준으로
+best 모델을 저장해 model selection leakage 를 방지한다.
+"""
 import os
 import sys
 import numpy as np
@@ -15,107 +21,105 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data_loader import get_dataloaders
 from DANN_model import DANNModel
 
+
 def train_dann():
-    # =====================================================================
-    # 1. 하이퍼파라미터 및 환경 설정
-    # =====================================================================
+    # ----------------------------------------------------------------------
+    # 하이퍼파라미터 및 환경 설정
+    # ----------------------------------------------------------------------
     BATCH_SIZE = 64
-    EPOCHS = 30 # DANN은 적대적 학습이라 조금 더 오래 돌리는게 좋습니다.
+    EPOCHS = 30  # DANN 은 적대적 학습이라 비교적 길게 학습한다.
     LEARNING_RATE = 1e-3
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     os.makedirs('weights', exist_ok=True)
     os.makedirs('results', exist_ok=True)
     save_path = 'weights/dann_best_model.pth'
 
-    # 🌟 데이터 로더 (4분할 구조로 호출)
+    # 데이터 로더 (Source/Target 의 train/val 4분할)
     train_loader, val_loader, tgt_train_loader, tgt_val_loader, num_classes, le = get_dataloaders(batch_size=BATCH_SIZE)
     class_names = le.classes_
 
-    # 모델 선언 (🚨 5채널 원복 🚨)
+    # 모델 선언 (EMG 2ch + IMU 3ch = 5채널 입력)
     model = DANNModel(in_channels=5, num_classes=num_classes).to(DEVICE)
-    
+
     # 손실 함수
-    criterion_class = nn.CrossEntropyLoss(label_smoothing=0.1) # 운동 분류용
-    criterion_domain = nn.CrossEntropyLoss() # 도메인 분류용 (Source vs Target)
-    
+    criterion_class = nn.CrossEntropyLoss(label_smoothing=0.1)  # 운동 분류용
+    criterion_domain = nn.CrossEntropyLoss()                    # 도메인 분류용 (Source vs Target)
+
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
     scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-    print("\n" + "="*50)
-    print("🚀 DANN Adversarial Training Start!")
+    print("\n" + "=" * 50)
+    print("DANN Adversarial Training Start")
     print(f"Targeting {num_classes} classes on {DEVICE}")
-    print("="*50)
+    print("=" * 50)
 
-    # =====================================================================
-    # 2. 메인 학습 루프
-    # =====================================================================
+    # ----------------------------------------------------------------------
+    # 메인 학습 루프
+    # ----------------------------------------------------------------------
     best_target_acc = 0.0
     best_val_acc = 0.0
-    
+
     for epoch in range(EPOCHS):
         model.train()
-        
-        # Source와 Target(Train) 데이터를 동시에 로드
+
+        # Source 와 Target(train) 데이터를 동시에 로드
         len_dataloader = min(len(train_loader), len(tgt_train_loader))
         data_zip = zip(train_loader, tgt_train_loader)
-        
+
         total_loss, total_c_loss, total_d_loss = 0, 0, 0
-        
-        # GRL의 Alpha 스케줄링
+
+        # GRL 의 alpha 스케줄링 (0 -> 1 로 점진 증가)
         p = float(epoch) / EPOCHS
         alpha = 2. / (1. + np.exp(-10 * p)) - 1
 
-        # 🌟 tqdm 프로그레스 바 적용
-        pbar = tqdm(enumerate(data_zip), total=len_dataloader, desc=f"Epoch [{epoch+1:02d}/{EPOCHS}]")
+        pbar = tqdm(enumerate(data_zip), total=len_dataloader, desc=f"Epoch [{epoch+1:02d}/{EPOCHS:02d}]")
 
         for i, ((src_x, src_y), (tgt_x, tgt_y)) in pbar:
             src_x, src_y = src_x.to(DEVICE), src_y.to(DEVICE)
             tgt_x, tgt_y = tgt_x.to(DEVICE), tgt_y.to(DEVICE)
-            
+
             optimizer.zero_grad()
-            
-            # --- [Step 1] Source 데이터 학습 (운동 분류 + 도메인 분류) ---
+
+            # Step 1. Source 데이터 (운동 분류 + 도메인 분류)
             src_domain_label = torch.zeros(src_x.size(0), dtype=torch.long).to(DEVICE)
             src_class_out, src_domain_out = model(src_x, alpha=alpha)
-            
+
             loss_s_label = criterion_class(src_class_out, src_y)
             loss_s_domain = criterion_domain(src_domain_out, src_domain_label)
-            
-            # --- [Step 2] Target 데이터 학습 (도메인 분류 + SDA 라벨 학습) ---
+
+            # Step 2. Target 데이터 (도메인 분류만, UDA 라 라벨 미사용)
             tgt_domain_label = torch.ones(tgt_x.size(0), dtype=torch.long).to(DEVICE)
             tgt_class_out, tgt_domain_out = model(tgt_x, alpha=alpha)
-            
+
             loss_t_domain = criterion_domain(tgt_domain_out, tgt_domain_label)
-            #SDA
-            # loss_t_label = criterion_class(tgt_class_out, tgt_y) 
-            
-            # --- [Step 3] 통합 손실 계산 및 역전파 ---
+            # SDA 설정에서는 아래 줄로 Target 라벨도 학습한다.
+            # loss_t_label = criterion_class(tgt_class_out, tgt_y)
+
+            # Step 3. 통합 손실 계산 및 역전파
             domain_loss = loss_s_domain + loss_t_domain
-            # class_loss = loss_s_label + loss_t_label
             class_loss = loss_s_label
-            
+
             loss = class_loss + domain_loss
             loss.backward()
             optimizer.step()
-            
+
             total_loss += loss.item()
             total_c_loss += class_loss.item()
             total_d_loss += domain_loss.item()
-            
-            # 실시간 손실 업데이트
+
             pbar.set_postfix({
-                'Total': f"{loss.item():.4f}", 
+                'Total': f"{loss.item():.4f}",
                 'Class': f"{class_loss.item():.4f}",
                 'Domain': f"{domain_loss.item():.4f}"
             })
 
         scheduler.step()
-        
-        # --- [Step 4] 검증 및 테스트 ---
+
+        # Step 4. 검증 및 평가
         model.eval()
-        
-        # Source Validation 평가
+
+        # Source validation 평가
         val_preds, val_targets = [], []
         with torch.no_grad():
             for vx, vy in val_loader:
@@ -124,8 +128,8 @@ def train_dann():
                 val_preds.extend(out.max(1)[1].cpu().numpy())
                 val_targets.extend(vy.numpy())
         val_acc = accuracy_score(val_targets, val_preds) * 100
-        
-        # Unseen Target Validation 평가 (리키지 방지)
+
+        # Target validation 평가 (model selection leakage 방지를 위해 저장 기준에서 제외)
         tgt_preds, tgt_targets = [], []
         with torch.no_grad():
             for tx, ty in tgt_val_loader:
@@ -134,35 +138,44 @@ def train_dann():
                 tgt_preds.extend(out.max(1)[1].cpu().numpy())
                 tgt_targets.extend(ty.numpy())
         tgt_acc = accuracy_score(tgt_targets, tgt_preds) * 100
-        
-        print(f"Epoch [{epoch+1:02d}/{EPOCHS}] | Loss: {total_loss/len_dataloader:.4f} | Source Val: {val_acc:.2f}% | Target Val: {tgt_acc:.2f}% | Alpha: {alpha:.3f}")
 
-        # ✅ Model Selection Leakage 방지: Source Val 기준으로 최고 성능 저장
-        if val_acc > best_val_acc:
+        # Source val 기준 best 모델 저장
+        is_best = val_acc > best_val_acc
+        if is_best:
             best_val_acc = val_acc
             best_target_acc = tgt_acc
             torch.save(model.state_dict(), save_path)
-            print(f"   -> 🌟 Best Source Val Model Saved! (Source Val: {best_val_acc:.2f}%)")
 
-    # =====================================================================
-    # 3. 최종 결과 평가 및 시각화 저장
-    # =====================================================================
-    print("\n" + "="*50)
-    print("📂 Saving Final Results...")
-    print("="*50)
-    
+        best_mark = "  (best)" if is_best else ""
+        print(
+            f"Epoch [{epoch+1:02d}/{EPOCHS:02d}] | "
+            f"Loss: {total_loss/len_dataloader:.4f} | "
+            f"Source Val: {val_acc:.2f}% | "
+            f"Target Val: {tgt_acc:.2f}% | "
+            f"Alpha: {alpha:.3f}"
+            f"{best_mark}"
+        )
+
+    # ----------------------------------------------------------------------
+    # 최종 결과 평가 및 시각화 저장
+    # ----------------------------------------------------------------------
+    print("\n" + "=" * 50)
+    print("Saving Final Results")
+    print("=" * 50)
+
     # 최고 성능 모델 로드
     model.load_state_dict(torch.load(save_path))
     model.eval()
-    
+
     print(
-        f"\n✅ 최종 결과 | "
+        f"\n최종 결과 | "
         f"Best Source Val Acc: {best_val_acc:.2f}% | "
         f"Target Acc at Best Source: {best_target_acc:.2f}% | "
         f"Shift: {best_val_acc - best_target_acc:.2f}%"
     )
-    # --- Source Domain Confusion Matrix ---
-    print("\n📊 Saving Source Domain Confusion Matrix...")
+
+    # Source 도메인 confusion matrix
+    print("\nSaving Source Domain Confusion Matrix...")
     v_preds_final, v_true_final = [], []
     with torch.no_grad():
         for vx, vy in val_loader:
@@ -182,8 +195,8 @@ def train_dann():
     plt.savefig('results/dann_source_confusion_matrix.png', dpi=300)
     plt.close()
 
-    # --- Target Domain (Unseen Validation) Confusion Matrix ---
-    print("🔍 Saving Target Domain Confusion Matrix...")
+    # Target 도메인(unseen validation) confusion matrix
+    print("Saving Target Domain Confusion Matrix...")
     t_preds_final, t_true_final = [], []
     with torch.no_grad():
         for tx, ty in tgt_val_loader:
@@ -201,8 +214,9 @@ def train_dann():
     plt.xticks(rotation=45)
     plt.tight_layout()
     plt.savefig('results/dann_target_confusion_matrix.png', dpi=300)
-    print("📊 혼동 행렬 시각화가 모두 저장되었습니다.")
+    print("혼동 행렬 시각화가 모두 저장되었습니다.")
     plt.show()
+
 
 if __name__ == "__main__":
     train_dann()

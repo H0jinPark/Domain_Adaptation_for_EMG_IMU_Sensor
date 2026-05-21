@@ -1,3 +1,8 @@
+"""DANN-MM-DualDisc 학습 스크립트 (멀티모달, EMG/IMU 분리 입력).
+
+DualEncoderDualDiscDANN 을 preprocessed_MM/ 데이터로 학습한다. DANN-MM 과 달리
+EMG/IMU 각 모달리티에 별도의 GRL + 도메인 판별기를 두어 도메인 손실을 2개 둔다.
+"""
 import os
 import sys
 import random
@@ -6,7 +11,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.preprocessing import LabelEncoder
@@ -15,15 +19,17 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from DANN.DANN_MM_tcat_model import TemporalConcatDANN
+from DANN.DANN_MM_dualdisc_model import DualEncoderDualDiscDANN
 
 DATA_DIR = 'preprocessed_MM'
 
 
 class MMDataset(Dataset):
+    """EMG/IMU 분리 텐서와 라벨을 담는 멀티모달 Dataset."""
+
     def __init__(self, emg, imu, y):
-        self.emg = torch.tensor(emg, dtype=torch.float32)  # (N, 2, 5000)
-        self.imu = torch.tensor(imu, dtype=torch.float32)  # (N, 3,  500)
+        self.emg = torch.tensor(emg, dtype=torch.float32)
+        self.imu = torch.tensor(imu, dtype=torch.float32)
         self.y   = torch.tensor(y,   dtype=torch.long)
 
     def __len__(self):
@@ -34,6 +40,7 @@ class MMDataset(Dataset):
 
 
 def load_split(prefix, le=None):
+    """preprocessed_MM/ 에서 한 split 의 EMG/IMU/label 을 로드한다."""
     emg = np.load(f'{DATA_DIR}/X_emg_{prefix}.npy')
     imu = np.load(f'{DATA_DIR}/X_imu_{prefix}.npy')
     y   = np.load(f'{DATA_DIR}/y_{prefix}.npy', allow_pickle=True)
@@ -44,6 +51,7 @@ def load_split(prefix, le=None):
 
 
 def get_dataloaders(batch_size=64):
+    """Source/Target 의 train/val 4분할 DataLoader 와 LabelEncoder 를 반환한다."""
     emg_tr, imu_tr, y_tr, le       = load_split('train')
     emg_val, imu_val, y_val, _     = load_split('val',          le)
     emg_tt, imu_tt, y_tt, _        = load_split('target_train', le)
@@ -66,6 +74,7 @@ def get_dataloaders(batch_size=64):
 
 
 def set_seed(seed):
+    """난수 시드를 고정해 실험 재현성을 확보한다."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -74,17 +83,19 @@ def set_seed(seed):
 
 @torch.no_grad()
 def evaluate(model, loader, device):
+    """loader 전체에 대한 정확도와 (예측, 정답) 리스트를 반환한다."""
     model.eval()
     preds, labels = [], []
     for emg, imu, y in loader:
         emg, imu = emg.to(device), imu.to(device)
-        out, _ = model(emg, imu, alpha=0.0)
+        out, _, _ = model(emg, imu, alpha=0.0)
         preds.extend(out.argmax(1).cpu().numpy())
         labels.extend(y.numpy())
     return accuracy_score(labels, preds), preds, labels
 
 
 def save_confusion_matrix(labels, preds, class_names, path, title):
+    """혼동 행렬을 히트맵으로 그려 PNG 로 저장한다."""
     cm = confusion_matrix(labels, preds)
     fig, ax = plt.subplots(figsize=(12, 10))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
@@ -97,27 +108,27 @@ def save_confusion_matrix(labels, preds, class_names, path, title):
     plt.close()
 
 
-def train(seed=42, epochs=30, batch_size=32, lr=1e-3, accum_steps=1):
+def train(seed=42, epochs=30, batch_size=64, lr=1e-3, dom_weight=1.0):
+    """단일 seed 로 DANN-MM-DualDisc 모델을 학습하고 Source/Target 정확도를 반환한다."""
     set_seed(seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\n{'='*55}")
-    print(f" DANN-MM-TCat Training  |  seed={seed}  device={device}")
+    print(f" DANN-MM-DualDisc Training  |  seed={seed}  device={device}")
     print(f"{'='*55}")
 
     os.makedirs('weights', exist_ok=True)
     os.makedirs('results', exist_ok=True)
 
     src_loader, val_loader, tgt_loader, tgt_val_loader, le = get_dataloaders(batch_size)
-    class_names = list(le.classes_)
-    num_classes = len(class_names)
-    weight_path = f'weights/dann_mm_tcat_seed{seed}_best.pth'
+    class_names  = list(le.classes_)
+    num_classes  = len(class_names)
+    weight_path  = f'weights/dann_mm_dualdisc_seed{seed}_best.pth'
 
-    model         = TemporalConcatDANN(num_classes=num_classes).to(device)
-    criterion_cls = nn.CrossEntropyLoss(label_smoothing=0.1)
-    criterion_dom = nn.CrossEntropyLoss()
-    optimizer     = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
-    scheduler     = CosineAnnealingLR(optimizer, T_max=epochs)
-    scaler        = GradScaler()
+    model          = DualEncoderDualDiscDANN(num_classes=num_classes).to(device)
+    criterion_cls  = nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion_dom  = nn.CrossEntropyLoss()
+    optimizer      = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
+    scheduler      = CosineAnnealingLR(optimizer, T_max=epochs)
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f" Total params: {total_params:,}\n")
@@ -126,82 +137,81 @@ def train(seed=42, epochs=30, batch_size=32, lr=1e-3, accum_steps=1):
 
     for epoch in range(1, epochs + 1):
         model.train()
+        # alpha: 학습 진행에 따라 0 -> 1 로 증가 (DANN 논문 스케줄)
         p     = epoch / epochs
         alpha = 2.0 / (1.0 + np.exp(-10 * p)) - 1.0
 
-        n_iter   = min(len(src_loader), len(tgt_loader))
+        n_iter = min(len(src_loader), len(tgt_loader))
         src_iter = iter(src_loader)
         tgt_iter = iter(tgt_loader)
 
-        cls_loss_sum = dom_loss_sum = 0.0
-        optimizer.zero_grad()
+        cls_sum = dom_e_sum = dom_i_sum = 0.0
 
-        for step in range(n_iter):
+        for _ in range(n_iter):
             src_emg, src_imu, src_y = next(src_iter)
             tgt_emg, tgt_imu, _     = next(tgt_iter)
 
-            src_emg = src_emg.to(device); src_imu = src_imu.to(device); src_y = src_y.to(device)
-            tgt_emg = tgt_emg.to(device); tgt_imu = tgt_imu.to(device)
+            src_emg, src_imu, src_y = src_emg.to(device), src_imu.to(device), src_y.to(device)
+            tgt_emg, tgt_imu        = tgt_emg.to(device), tgt_imu.to(device)
 
-            B_src = src_emg.size(0)
-            all_emg = torch.cat([src_emg, tgt_emg], dim=0)
-            all_imu = torch.cat([src_imu, tgt_imu], dim=0)
-            dom_labels = torch.cat([
-                torch.zeros(B_src,                dtype=torch.long, device=device),
-                torch.ones (tgt_emg.size(0),      dtype=torch.long, device=device),
-            ])
+            src_dom = torch.zeros(src_emg.size(0), dtype=torch.long, device=device)
+            tgt_dom = torch.ones (tgt_emg.size(0), dtype=torch.long, device=device)
 
-            with autocast():
-                all_cls, all_dom = model(all_emg, all_imu, alpha)
-                src_cls     = all_cls[:B_src]
-                src_dom_out = all_dom[:B_src]
-                tgt_dom_out = all_dom[B_src:]
+            optimizer.zero_grad()
 
-                loss_cls = criterion_cls(src_cls, src_y)
-                loss_dom = (criterion_dom(src_dom_out, dom_labels[:B_src]) +
-                            criterion_dom(tgt_dom_out, dom_labels[B_src:]))
-                loss = (loss_cls + loss_dom) / accum_steps
+            src_cls, src_de, src_di = model(src_emg, src_imu, alpha)
+            _,       tgt_de, tgt_di = model(tgt_emg, tgt_imu, alpha)
 
-            scaler.scale(loss).backward()
+            loss_cls   = criterion_cls(src_cls, src_y)
+            loss_dom_e = criterion_dom(src_de, src_dom) + criterion_dom(tgt_de, tgt_dom)
+            loss_dom_i = criterion_dom(src_di, src_dom) + criterion_dom(tgt_di, tgt_dom)
+            loss       = loss_cls + dom_weight * 0.5 * (loss_dom_e + loss_dom_i)
 
-            if (step + 1) % accum_steps == 0 or (step + 1) == n_iter:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-            cls_loss_sum += loss_cls.item()
-            dom_loss_sum += loss_dom.item()
+            cls_sum   += loss_cls.item()
+            dom_e_sum += loss_dom_e.item()
+            dom_i_sum += loss_dom_i.item()
 
         scheduler.step()
 
         val_acc, _, _ = evaluate(model, val_loader,     device)
         tgt_acc, _, _ = evaluate(model, tgt_val_loader, device)
 
-        flag = ''
-        if val_acc > best_val_acc:
+        # Source val 기준 best 모델 저장
+        is_best = val_acc > best_val_acc
+        if is_best:
             best_val_acc = val_acc
             torch.save(model.state_dict(), weight_path)
-            flag = '  <- best'
 
-        print(f"[{epoch:03d}/{epochs}] alpha={alpha:.3f}  "
-              f"cls={cls_loss_sum/n_iter:.4f}  dom={dom_loss_sum/n_iter:.4f}  "
-              f"val={val_acc:.4f}  tgt={tgt_acc:.4f}{flag}")
+        best_mark = "  (best)" if is_best else ""
+        print(
+            f"Epoch [{epoch:02d}/{epochs:02d}] | "
+            f"Class: {cls_sum/n_iter:.4f} | "
+            f"Domain EMG: {dom_e_sum/n_iter:.4f} | "
+            f"Domain IMU: {dom_i_sum/n_iter:.4f} | "
+            f"Source Val: {val_acc*100:.2f}% | "
+            f"Target Val: {tgt_acc*100:.2f}% | "
+            f"Alpha: {alpha:.3f}"
+            f"{best_mark}"
+        )
 
-    print(f"\n Best val acc: {best_val_acc:.4f}  (weights: {weight_path})")
+    print(f"\n Best val acc: {best_val_acc*100:.2f}%  (weights: {weight_path})")
     model.load_state_dict(torch.load(weight_path, map_location=device))
 
     src_acc, src_preds, src_labels = evaluate(model, val_loader,     device)
     tgt_acc, tgt_preds, tgt_labels = evaluate(model, tgt_val_loader, device)
 
-    print(f" Final Source Acc : {src_acc:.4f}")
-    print(f" Final Target Acc : {tgt_acc:.4f}")
+    print(f" Final Source Acc : {src_acc*100:.2f}%")
+    print(f" Final Target Acc : {tgt_acc*100:.2f}%")
 
     save_confusion_matrix(src_labels, src_preds, class_names,
-                          f'results/dann_mm_tcat_seed{seed}_source_cm.png',
-                          f'DANN-MM-TCat Source (seed={seed}, acc={src_acc:.4f})')
+                          f'results/dann_mm_dualdisc_seed{seed}_source_cm.png',
+                          f'DANN-MM-DualDisc Source (seed={seed}, acc={src_acc:.4f})')
     save_confusion_matrix(tgt_labels, tgt_preds, class_names,
-                          f'results/dann_mm_tcat_seed{seed}_target_cm.png',
-                          f'DANN-MM-TCat Target (seed={seed}, acc={tgt_acc:.4f})')
+                          f'results/dann_mm_dualdisc_seed{seed}_target_cm.png',
+                          f'DANN-MM-DualDisc Target (seed={seed}, acc={tgt_acc:.4f})')
     return src_acc, tgt_acc
 
 
@@ -209,12 +219,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed',        type=int,   default=42)
     parser.add_argument('--multi_seed',  action='store_true')
-    parser.add_argument('--seeds',       type=int,   nargs='+', default=[0, 1, 2, 3, 4])
+    parser.add_argument('--seeds',       type=int,   nargs='+', default=[0, 1, 2, 3])
     parser.add_argument('--epochs',      type=int,   default=30)
-    parser.add_argument('--batch_size',  type=int,   default=32)
+    parser.add_argument('--batch_size',  type=int,   default=64)
     parser.add_argument('--lr',          type=float, default=1e-3)
-    parser.add_argument('--accum_steps', type=int,   default=1,
-                        help='gradient accumulation steps (effective batch = batch_size * accum_steps)')
+    parser.add_argument('--dom_weight',  type=float, default=1.0)
     args = parser.parse_args()
 
     if args.multi_seed:
@@ -222,16 +231,15 @@ if __name__ == "__main__":
         for s in args.seeds:
             src_acc, tgt_acc = train(seed=s, epochs=args.epochs,
                                      batch_size=args.batch_size, lr=args.lr,
-                                     accum_steps=args.accum_steps)
+                                     dom_weight=args.dom_weight)
             results.append((s, src_acc, tgt_acc))
         print("\n" + "=" * 55)
-        print(" Multi-seed Summary")
+        print(" Multi-seed Summary  (DANN-MM-DualDisc)")
         print(f"{'Seed':>6}  {'Src Acc':>8}  {'Tgt Acc':>8}")
         for s, sa, ta in results:
             print(f"{s:>6}  {sa:>8.4f}  {ta:>8.4f}")
-        print(f"{'Mean':>6}  {np.mean([r[1] for r in results]):>8.4f}  "
-              f"{np.mean([r[2] for r in results]):>8.4f}")
+        print(f"{'Mean':>6}  {np.mean([r[1] for r in results]):>8.4f}  {np.mean([r[2] for r in results]):>8.4f}")
     else:
         train(seed=args.seed, epochs=args.epochs,
               batch_size=args.batch_size, lr=args.lr,
-              accum_steps=args.accum_steps)
+              dom_weight=args.dom_weight)

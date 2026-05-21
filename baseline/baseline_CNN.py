@@ -1,7 +1,15 @@
+"""CNN 기반 baseline 모델 정의 (CNNBaselineModel).
+
+baseline_train.py 의 --model cnn 으로 학습한다. dilation 없는 일반 1D Conv
+residual block 과 SE block 으로 구성된 시계열 분류 백본.
+"""
 import torch
 import torch.nn as nn
 
+
 class SEBlock1D(nn.Module):
+    """Squeeze-and-Excitation block (채널 어텐션)."""
+
     def __init__(self, channels, reduction=16):
         super(SEBlock1D, self).__init__()
         hidden = max(channels // reduction, 1)
@@ -21,6 +29,8 @@ class SEBlock1D(nn.Module):
 
 
 class ResidualCNNBlock(nn.Module):
+    """1D Conv 2개 + SE block + residual connection 으로 구성된 CNN block."""
+
     def __init__(self, in_channels, out_channels, kernel_size=5, dropout=0.5):
         super(ResidualCNNBlock, self).__init__()
         padding = kernel_size // 2
@@ -37,6 +47,7 @@ class ResidualCNNBlock(nn.Module):
         )
 
         self.se = SEBlock1D(out_channels)
+        # 입출력 채널 수가 다르면 1x1 Conv 로 residual 경로를 맞춘다.
         self.downsample = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else None
 
     def forward(self, x):
@@ -47,9 +58,12 @@ class ResidualCNNBlock(nn.Module):
 
 
 class CNNBaselineModel(nn.Module):
+    """CNN baseline 분류기. 입력 (B, in_channels, 5000) -> (B, num_classes)."""
+
     def __init__(self, in_channels=5, num_classes=10):
         super(CNNBaselineModel, self).__init__()
 
+        # Stem: 초기 Conv1d 로 채널 확장 및 시퀀스 길이 축소
         self.stem = nn.Sequential(
             nn.Conv1d(in_channels, 64, kernel_size=11, stride=5, padding=5),
             nn.BatchNorm1d(64),
@@ -84,6 +98,9 @@ class CNNBaselineModel(nn.Module):
         return self.classifier(x)
 
 
+# ----------------------------------------------------------------------
+# 단독 실행 테스트 (출력 shape 검증용)
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
     model = CNNBaselineModel(in_channels=5, num_classes=10)
 
@@ -92,7 +109,7 @@ if __name__ == "__main__":
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    print("Model successfully built!")
+    print("Model successfully built.")
     print(f"Input shape:  {dummy_input.shape}")
     print(f"Output shape: {output.shape} (Expected: 32, 10)")
     print(f"Total Trainable Parameters: {total_params:,}")

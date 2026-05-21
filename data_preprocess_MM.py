@@ -1,3 +1,17 @@
+"""멀티모달(EMG/IMU 분리) 전처리 스크립트.
+
+data_preprocess.py 와 달리 EMG 와 IMU 를 각자의 샘플링 레이트로 분리 저장한다.
+멀티모달 모델(DualEncoder, DANN-MM, CDAN-MM 등)이 사용한다.
+
+채널 규약
+  EMG: [biceps, triceps]                 -> 1000Hz, window=5000 (5초)
+  IMU: [triceps_X, triceps_Y, triceps_Z] ->  100Hz, window=500  (5초)
+
+저장 파일 (preprocessed_MM/)
+  X_emg_{prefix}.npy : (N, 2, 5000)
+  X_imu_{prefix}.npy : (N, 3,  500)
+  y_{prefix}.npy     : (N,)
+"""
 import numpy as np
 import pandas as pd
 from scipy.signal import butter, filtfilt
@@ -7,17 +21,6 @@ import os
 import warnings
 warnings.filterwarnings('ignore')
 
-# =====================================================================
-# 채널 규약
-#   EMG: [biceps, triceps]               → 1000Hz, window=5000 (5초)
-#   IMU: [triceps_X, triceps_Y, triceps_Z] → 100Hz,  window=500  (5초)
-#
-# 저장 파일 (preprocessed_MM/)
-#   X_emg_{prefix}.npy  : (N, 2, 5000)
-#   X_imu_{prefix}.npy  : (N, 3, 500)
-#   y_{prefix}.npy      : (N,)
-# =====================================================================
-
 EMG_FS     = 1000   # EMG 목표 샘플링 레이트
 IMU_FS     = 100    # IMU 목표 샘플링 레이트 (다운샘플 배수: EMG_FS // IMU_FS = 10)
 EMG_WINDOW = 5000   # EMG 윈도우 크기 (5초)
@@ -26,20 +29,22 @@ EMG_STRIDE = 500    # EMG 기준 스트라이드 (0.5초)
 
 
 class MultiModalPreprocessor:
+    """EMG/IMU 를 분리 저장하는 멀티모달 전처리기."""
+
     def __init__(self):
         self.emg_cols  = ['biceps', 'triceps']
         self.imu_cols  = ['triceps_X', 'triceps_Y', 'triceps_Z']
         self.label_col = 'exercise'
-        self.imu_step  = EMG_FS // IMU_FS  # 1000Hz → 100Hz: 10샘플마다 1개
+        self.imu_step  = EMG_FS // IMU_FS  # 1000Hz -> 100Hz: 10샘플마다 1개
 
-    # ------------------------------------------------------------------
     def _bandpass_emg(self, data):
+        """EMG 신호에 20~450Hz 밴드패스 필터를 적용한다."""
         nyq = 0.5 * EMG_FS
         b, a = butter(4, [20.0 / nyq, 450.0 / nyq], btype='bandpass', analog=False)
         return filtfilt(b, a, data)
 
-    # ------------------------------------------------------------------
     def process_single_session(self, session_df, time_col):
+        """단일 세션을 전처리하고 (X_emg, X_imu, y) 윈도우 리스트를 반환한다."""
         session_df = session_df.sort_values(by=time_col).copy()
         session_df['datetime'] = pd.to_timedelta(session_df[time_col], unit='s')
         session_df = session_df.set_index('datetime')
@@ -71,12 +76,12 @@ class MultiModalPreprocessor:
 
         for start in range(0, len(df) - EMG_WINDOW + 1, EMG_STRIDE):
             # EMG: 5000 샘플 그대로
-            emg_win = emg_vals[start : start + EMG_WINDOW]           # (5000, 2)
+            emg_win = emg_vals[start : start + EMG_WINDOW]                  # (5000, 2)
 
-            # IMU: 같은 시간 구간을 10배 다운샘플 → 500 샘플
+            # IMU: 같은 시간 구간을 10배 다운샘플 -> 500 샘플
             imu_win = imu_vals[start : start + EMG_WINDOW : self.imu_step]  # (500, 3)
 
-            # 최빈 라벨
+            # 윈도우 내 최빈 라벨
             win_labels = label_vals[start : start + EMG_WINDOW]
             u, counts  = np.unique(win_labels, return_counts=True)
             label      = u[np.argmax(counts)]
@@ -87,8 +92,8 @@ class MultiModalPreprocessor:
 
         return X_emg, X_imu, y_all
 
-    # ------------------------------------------------------------------
     def save_processed_data(self, df, session_list, session_col, time_col, prefix):
+        """세션 리스트를 전처리해 EMG/IMU/label 을 preprocessed_MM/ 에 저장한다."""
         all_emg, all_imu, all_y = [], [], []
         total = len(session_list)
 
@@ -103,7 +108,7 @@ class MultiModalPreprocessor:
             if (i + 1) % max(1, total // 5) == 0:
                 print(f"  [{prefix}] {i+1}/{total} sessions done")
 
-        # (N, T, C) → (N, C, T) 로 저장
+        # (N, T, C) -> (N, C, T) 로 축 교환 후 저장
         emg_np = np.array(all_emg).transpose(0, 2, 1).astype(np.float32)  # (N, 2, 5000)
         imu_np = np.array(all_imu).transpose(0, 2, 1).astype(np.float32)  # (N, 3, 500)
         y_np   = np.array(all_y)
@@ -113,10 +118,12 @@ class MultiModalPreprocessor:
         np.save(f'preprocessed_MM/X_imu_{prefix}.npy', imu_np)
         np.save(f'preprocessed_MM/y_{prefix}.npy',     y_np)
 
-        print(f"  ✅ {prefix} → EMG {emg_np.shape}  IMU {imu_np.shape}  y {y_np.shape}")
+        print(f"  {prefix} -> EMG {emg_np.shape}  IMU {imu_np.shape}  y {y_np.shape}")
 
 
-# =====================================================================
+# ----------------------------------------------------------------------
+# 실행 영역: 세션 단위 8:2 분할 후 split 별 저장
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
     prep = MultiModalPreprocessor()
 
@@ -135,7 +142,7 @@ if __name__ == "__main__":
     prep.save_processed_data(df_tgt, tgt_val_sess,   'csv_filename_l', 'Index_Time', 'target_val')
 
     print("\n" + "=" * 50)
-    print("완료! preprocessed_MM/ 에 저장됨")
-    print("  EMG: (N, 2, 5000)  — 1000Hz, 5초")
-    print("  IMU: (N, 3,  500)  —  100Hz, 5초")
+    print("완료. preprocessed_MM/ 에 저장됨")
+    print("  EMG: (N, 2, 5000)  -- 1000Hz, 5초")
+    print("  IMU: (N, 3,  500)  --  100Hz, 5초")
     print("=" * 50)

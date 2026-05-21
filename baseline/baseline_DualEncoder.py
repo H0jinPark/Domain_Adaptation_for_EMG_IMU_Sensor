@@ -1,89 +1,100 @@
+"""멀티모달 DualEncoder 모델 정의.
+
+EMG/IMU 를 각각 전용 인코더로 처리한 뒤 feature 를 concat 해 분류한다.
+EMGEncoder / IMUEncoder 는 TCN baseline(AdvancedBaselineModel)과 같은
+ResidualTCNBlock 으로 구성된 4층 인코더이며, 입력 채널 수만 다르고 출력은
+256차원으로 같다. 이 두 인코더는 DANN-MM 등 멀티모달 DA 모델에서도 재사용된다.
+
+입력 규약 (preprocessed_MM/)
+  x_emg : (B, 2, 5000)  -- EMG 1000Hz, 5초
+  x_imu : (B, 3,  500)  -- IMU  100Hz, 5초
+"""
+import os
+import sys
+
 import torch
 import torch.nn as nn
 
-# 입력 규약
-#   x_emg : (B, 2, 1000)  — EMG 1000Hz, 1초
-#   x_imu : (B, 3,  100)  — IMU  100Hz, 1초
-
-from .baseline_model import ResidualTCNBlock
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from baseline.baseline_model import ResidualTCNBlock
 
 
-class EMGEncoder(nn.Module):
-    """EMG 전용 인코더 (B, 2, 1000) → (B, 256)
-    - 고주파 근전도 신호(20~450Hz) 처리에 맞게 설계
-    - stride=5 stem으로 1000 → 200, 이후 TCN + MaxPool
+class _TCNEncoder(nn.Module):
+    """ResidualTCNBlock 4층으로 구성된 feature extractor.
+
+    TCN baseline 과 동일한 stem + Residual TCN block 패턴을 따르되, 블록 4개
+    (dilation 1,2,4,8)로 256차원까지만 키운다. 입력 채널 수만 인자로 받으며,
+    출력은 시퀀스 길이와 무관하게 (B, 256) 이다 (AdaptiveAvgPool 로 요약).
     """
-    def __init__(self):
+
+    def __init__(self, in_channels):
         super().__init__()
+        # Stem: 초기 Conv1d 로 채널 확장 및 시퀀스 길이 축소
         self.stem = nn.Sequential(
-            nn.Conv1d(2, 64, kernel_size=11, stride=5, padding=5),  # 1000 → 200
+            nn.Conv1d(in_channels, 64, kernel_size=11, stride=5, padding=5),
             nn.BatchNorm1d(64),
             nn.GELU(),
         )
-        self.blocks = nn.Sequential(
-            ResidualTCNBlock(64,  64,  dilation=1),
-            ResidualTCNBlock(64,  128, dilation=2),
-            nn.MaxPool1d(2),                          # 200 → 100
+        # Residual TCN layers: 4개 블록, dilation 1,2,4,8 로 시간 범위 확장
+        self.layers = nn.Sequential(
+            ResidualTCNBlock(64, 64, dilation=1),
+            ResidualTCNBlock(64, 128, dilation=2),
+            nn.MaxPool1d(2),
             ResidualTCNBlock(128, 128, dilation=4),
             ResidualTCNBlock(128, 256, dilation=8),
             nn.AdaptiveAvgPool1d(1),
         )
 
     def forward(self, x):
-        return self.blocks(self.stem(x)).squeeze(-1)  # (B, 256)
+        return self.layers(self.stem(x)).squeeze(-1)  # (B, 256)
 
 
-class IMUEncoder(nn.Module):
-    
-    """IMU 전용 인코더 (B, 3, 100) → (B, 128)
-    - 저주파 가속도/자이로 신호(100Hz) 처리
-    - 시퀀스가 짧으므로 stride 없이 가벼운 TCN
-    """
+class EMGEncoder(_TCNEncoder):
+    """EMG 전용 인코더.  (B, 2, 5000) -> (B, 256)"""
+
     def __init__(self):
-        super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv1d(3, 32, kernel_size=5, stride=1, padding=2),  # 100 → 100 (길이 유지)
-            nn.BatchNorm1d(32),
-            nn.GELU(),
-        )
-        self.blocks = nn.Sequential(
-            ResidualTCNBlock(32,  64,  dilation=1),
-            ResidualTCNBlock(64,  128, dilation=2),
-            nn.AdaptiveAvgPool1d(1),
-        )
+        super().__init__(in_channels=2)
 
-    def forward(self, x):
-        return self.blocks(self.stem(x)).squeeze(-1)  # (B, 128)
+
+class IMUEncoder(_TCNEncoder):
+    """IMU 전용 인코더.  (B, 3, 500) -> (B, 256)"""
+
+    def __init__(self):
+        super().__init__(in_channels=3)
 
 
 class DualEncoderModel(nn.Module):
-    """EMG + IMU 독립 인코딩 후 피처 융합 → 분류
+    """EMG/IMU 독립 인코딩 후 feature 융합 분류기.
 
-    forward(x_emg, x_imu) → (B, num_classes)
-    get_features(x_emg, x_imu) → (B, 384)  ← DA 방법에서 사용
+    forward(x_emg, x_imu)      -> (B, num_classes)
+    get_features(x_emg, x_imu) -> (B, 512)   # DA 방법에서 feature 로 사용
     """
+
     def __init__(self, num_classes=10):
         super().__init__()
-        self.emg_encoder = EMGEncoder()   # → 256
-        self.imu_encoder = IMUEncoder()   # → 128
-        # fused dim = 256 + 128 = 384
+        self.emg_encoder = EMGEncoder()   # -> 256
+        self.imu_encoder = IMUEncoder()   # -> 256
+        # 융합 차원 = 256 + 256 = 512
         self.classifier = nn.Sequential(
-            nn.Linear(384, 256),
+            nn.Linear(512, 256),
             nn.GELU(),
             nn.Dropout(0.5),
             nn.Linear(256, num_classes),
         )
 
     def get_features(self, x_emg, x_imu):
+        """EMG/IMU feature 를 concat 해 (B, 512) 융합 feature 를 반환한다."""
         f_emg = self.emg_encoder(x_emg)
         f_imu = self.imu_encoder(x_imu)
-        return torch.cat([f_emg, f_imu], dim=1)  # (B, 384)
+        return torch.cat([f_emg, f_imu], dim=1)  # (B, 512)
 
     def forward(self, x_emg, x_imu):
         return self.classifier(self.get_features(x_emg, x_imu))
 
 
-# =====================================================================
+# ----------------------------------------------------------------------
+# 단독 실행 테스트 (출력 shape 검증용)
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
     model = DualEncoderModel(num_classes=10)
     emg = torch.randn(32, 2, 5000)
@@ -96,5 +107,5 @@ if __name__ == "__main__":
     print(f"EMG input : {tuple(emg.shape)}")
     print(f"IMU input : {tuple(imu.shape)}")
     print(f"Output    : {tuple(out.shape)}   (expected [32, 10])")
-    print(f"Features  : {tuple(feat.shape)}  (expected [32, 384])")
+    print(f"Features  : {tuple(feat.shape)}  (expected [32, 512])")
     print(f"Total params: {total:,}")

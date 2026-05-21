@@ -1,3 +1,9 @@
+"""DANN-MM 학습 스크립트 (멀티모달, EMG/IMU 분리 입력).
+
+DualEncoderDANN 을 preprocessed_MM/ 데이터(EMG (N,2,5000) / IMU (N,3,500))로
+학습한다. EMG/IMU 를 독립 인코더로 처리한 뒤 concat 하고 GRL 로 도메인 적대 학습을
+수행한다. --multi_seed 로 여러 seed 반복 실험이 가능하다.
+"""
 import os
 import sys
 import random
@@ -20,6 +26,8 @@ DATA_DIR = 'preprocessed_MM'
 
 
 class MMDataset(Dataset):
+    """EMG/IMU 분리 텐서와 라벨을 담는 멀티모달 Dataset."""
+
     def __init__(self, emg, imu, y):
         self.emg = torch.tensor(emg, dtype=torch.float32)  # (N, 2, 5000)
         self.imu = torch.tensor(imu, dtype=torch.float32)  # (N, 3,  500)
@@ -33,6 +41,7 @@ class MMDataset(Dataset):
 
 
 def load_split(prefix, le=None):
+    """preprocessed_MM/ 에서 한 split(train/val/target_*)의 EMG/IMU/label 을 로드한다."""
     emg = np.load(f'{DATA_DIR}/X_emg_{prefix}.npy')
     imu = np.load(f'{DATA_DIR}/X_imu_{prefix}.npy')
     y   = np.load(f'{DATA_DIR}/y_{prefix}.npy', allow_pickle=True)
@@ -43,6 +52,7 @@ def load_split(prefix, le=None):
 
 
 def get_dataloaders(batch_size=64):
+    """Source/Target 의 train/val 4분할 DataLoader 와 LabelEncoder 를 반환한다."""
     emg_tr, imu_tr, y_tr, le       = load_split('train')
     emg_val, imu_val, y_val, _     = load_split('val',          le)
     emg_tt, imu_tt, y_tt, _        = load_split('target_train', le)
@@ -65,6 +75,7 @@ def get_dataloaders(batch_size=64):
 
 
 def set_seed(seed):
+    """난수 시드를 고정해 실험 재현성을 확보한다."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -73,6 +84,7 @@ def set_seed(seed):
 
 @torch.no_grad()
 def evaluate(model, loader, device):
+    """loader 전체에 대한 정확도와 (예측, 정답) 리스트를 반환한다."""
     model.eval()
     preds, labels = [], []
     for emg, imu, y in loader:
@@ -84,6 +96,7 @@ def evaluate(model, loader, device):
 
 
 def save_confusion_matrix(labels, preds, class_names, path, title):
+    """혼동 행렬을 히트맵으로 그려 PNG 로 저장한다."""
     cm = confusion_matrix(labels, preds)
     fig, ax = plt.subplots(figsize=(12, 10))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
@@ -97,6 +110,7 @@ def save_confusion_matrix(labels, preds, class_names, path, title):
 
 
 def train(seed=42, epochs=30, batch_size=64, lr=1e-3):
+    """단일 seed 로 DANN-MM 모델을 학습하고 Source/Target 정확도를 반환한다."""
     set_seed(seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\n{'='*55}")
@@ -124,7 +138,7 @@ def train(seed=42, epochs=30, batch_size=64, lr=1e-3):
 
     for epoch in range(1, epochs + 1):
         model.train()
-        # alpha: 0 → 1 as training progresses (DANN paper schedule)
+        # alpha: 학습 진행에 따라 0 -> 1 로 증가 (DANN 논문 스케줄)
         p     = epoch / epochs
         alpha = 2.0 / (1.0 + np.exp(-10 * p)) - 1.0
 
@@ -165,25 +179,32 @@ def train(seed=42, epochs=30, batch_size=64, lr=1e-3):
         val_acc, _, _     = evaluate(model, val_loader,     device)
         tgt_acc, _, _     = evaluate(model, tgt_val_loader, device)
 
-        flag = ''
-        if val_acc > best_val_acc:
+        # Source val 기준 best 모델 저장
+        is_best = val_acc > best_val_acc
+        if is_best:
             best_val_acc = val_acc
             torch.save(model.state_dict(), weight_path)
-            flag = '  <- best'
 
-        print(f"[{epoch:03d}/{epochs}] alpha={alpha:.3f}  "
-              f"cls={cls_loss_sum/n_iter:.4f}  dom={dom_loss_sum/n_iter:.4f}  "
-              f"val_acc={val_acc:.4f}  tgt_acc={tgt_acc:.4f}{flag}")
+        best_mark = "  (best)" if is_best else ""
+        print(
+            f"Epoch [{epoch:02d}/{epochs:02d}] | "
+            f"Class: {cls_loss_sum/n_iter:.4f} | "
+            f"Domain: {dom_loss_sum/n_iter:.4f} | "
+            f"Source Val: {val_acc*100:.2f}% | "
+            f"Target Val: {tgt_acc*100:.2f}% | "
+            f"Alpha: {alpha:.3f}"
+            f"{best_mark}"
+        )
 
     # 최고 모델로 최종 평가
-    print(f"\n Best val acc: {best_val_acc:.4f}  (weights: {weight_path})")
+    print(f"\n Best val acc: {best_val_acc*100:.2f}%  (weights: {weight_path})")
     model.load_state_dict(torch.load(weight_path, map_location=device))
 
     src_acc, src_preds, src_labels = evaluate(model, val_loader,     device)
     tgt_acc, tgt_preds, tgt_labels = evaluate(model, tgt_val_loader, device)
 
-    print(f" Final Source Acc : {src_acc:.4f}")
-    print(f" Final Target Acc : {tgt_acc:.4f}")
+    print(f" Final Source Acc : {src_acc*100:.2f}%")
+    print(f" Final Target Acc : {tgt_acc*100:.2f}%")
 
     save_confusion_matrix(src_labels, src_preds, class_names,
                           f'results/dann_mm_seed{seed}_source_cm.png',

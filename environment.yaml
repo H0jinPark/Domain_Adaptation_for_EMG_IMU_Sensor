@@ -1,28 +1,30 @@
 name: mda
 
 channels:
-  - pytorch
-  - nvidia
   - defaults
 
 dependencies:
+  # 과학 계산 / 데이터 처리
   - python=3.10
   - pip
   - numpy
   - pandas
+  - scipy
   - scikit-learn
+
+  # 시각화
   - matplotlib
   - seaborn
+
+  # parquet I/O
   - pyarrow
-  - fastparquet
+
+  # 노트북
   - jupyter
   - ipykernel
 
+  # PyTorch (CUDA 12.8 빌드) 및 학습 유틸
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu128
       - torch==2.7.1+cu128
-      - torchvision==0.22.1+cu128
-      - torchaudio==2.7.1+cu128
       - tqdm
-      - tensorboard
-      - koreanize-matplotlib

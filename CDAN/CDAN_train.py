@@ -1,3 +1,8 @@
+"""CDAN 학습 스크립트 (단일 백본, 5채널 동기화 입력).
+
+Conditional Domain Adversarial Network 로 Source 라벨만 사용해 Target 운동 분류
+성능을 끌어올린다. Source val 기준으로 best 모델을 저장한다.
+"""
 import os
 import sys
 import numpy as np
@@ -17,6 +22,9 @@ from CDAN_model import CDANModel
 
 
 def train_cdan():
+    # ----------------------------------------------------------------------
+    # 하이퍼파라미터 및 환경 설정
+    # ----------------------------------------------------------------------
     BATCH_SIZE = 64
     EPOCHS = 30
     LEARNING_RATE = 1e-3
@@ -41,10 +49,13 @@ def train_cdan():
     scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
     print("\n" + "=" * 50)
-    print("🚀 CDAN Conditional Adversarial Training Start!")
+    print("CDAN Conditional Adversarial Training Start")
     print(f"Targeting {num_classes} classes on {DEVICE}")
     print("=" * 50)
 
+    # ----------------------------------------------------------------------
+    # 메인 학습 루프
+    # ----------------------------------------------------------------------
     best_target_acc = 0.0
     best_val_acc = 0.0
 
@@ -56,13 +67,14 @@ def train_cdan():
 
         total_loss, total_c_loss, total_d_loss = 0.0, 0.0, 0.0
 
+        # GRL 의 alpha 스케줄링 (0 -> 1 로 점진 증가)
         p = float(epoch) / EPOCHS
         alpha = 2.0 / (1.0 + np.exp(-10 * p)) - 1.0
 
         pbar = tqdm(
             enumerate(data_zip),
             total=len_dataloader,
-            desc=f"Epoch [{epoch+1:02d}/{EPOCHS}]"
+            desc=f"Epoch [{epoch+1:02d}/{EPOCHS:02d}]"
         )
 
         for i, ((src_x, src_y), (tgt_x, tgt_y)) in pbar:
@@ -102,8 +114,10 @@ def train_cdan():
 
         scheduler.step()
 
+        # 검증 및 평가
         model.eval()
 
+        # Source validation 평가
         val_preds, val_targets = [], []
         with torch.no_grad():
             for vx, vy in val_loader:
@@ -114,6 +128,7 @@ def train_cdan():
 
         val_acc = accuracy_score(val_targets, val_preds) * 100
 
+        # Target validation 평가
         tgt_preds, tgt_targets = [], []
         with torch.no_grad():
             for tx, ty in tgt_val_loader:
@@ -124,37 +139,44 @@ def train_cdan():
 
         tgt_acc = accuracy_score(tgt_targets, tgt_preds) * 100
 
+        # Source val 기준 best 모델 저장
+        is_best = val_acc > best_val_acc
+        if is_best:
+            best_val_acc = val_acc
+            best_target_acc = tgt_acc
+            torch.save(model.state_dict(), save_path)
+
+        best_mark = "  (best)" if is_best else ""
         print(
-            f"Epoch [{epoch+1:02d}/{EPOCHS}] | "
+            f"Epoch [{epoch+1:02d}/{EPOCHS:02d}] | "
             f"Loss: {total_loss / len_dataloader:.4f} | "
             f"Class: {total_c_loss / len_dataloader:.4f} | "
             f"Domain: {total_d_loss / len_dataloader:.4f} | "
             f"Source Val: {val_acc:.2f}% | "
             f"Target Val: {tgt_acc:.2f}% | "
             f"Alpha: {alpha:.3f}"
+            f"{best_mark}"
         )
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_target_acc = tgt_acc
-            torch.save(model.state_dict(), save_path)
-            print(f"   -> 🌟 Best Source Val Model Saved! (Source Val: {best_val_acc:.2f}%)")
-
+    # ----------------------------------------------------------------------
+    # 최종 결과 평가 및 시각화 저장
+    # ----------------------------------------------------------------------
     print("\n" + "=" * 50)
-    print("📂 Saving Final Results...")
+    print("Saving Final Results")
     print("=" * 50)
 
     model.load_state_dict(torch.load(save_path, map_location=DEVICE))
     model.eval()
 
     print(
-        f"\n✅ 최종 결과 | "
+        f"\n최종 결과 | "
         f"Best Source Val Acc: {best_val_acc:.2f}% | "
         f"Target Acc at Best Source: {best_target_acc:.2f}% | "
         f"Shift: {best_val_acc - best_target_acc:.2f}%"
     )
 
-    print("\n📊 Saving Source Domain Confusion Matrix...")
+    # Source 도메인 confusion matrix
+    print("\nSaving Source Domain Confusion Matrix...")
 
     v_preds_final, v_true_final = [], []
     with torch.no_grad():
@@ -183,7 +205,8 @@ def train_cdan():
     plt.savefig("results/cdan_source_confusion_matrix.png", dpi=300)
     plt.close()
 
-    print("🔍 Saving Target Domain Confusion Matrix...")
+    # Target 도메인 confusion matrix
+    print("Saving Target Domain Confusion Matrix...")
 
     t_preds_final, t_true_final = [], []
     with torch.no_grad():
@@ -214,7 +237,7 @@ def train_cdan():
     plt.xticks(rotation=45)
     plt.tight_layout()
     plt.savefig("results/cdan_target_confusion_matrix.png", dpi=300)
-    print("📊 혼동 행렬 시각화가 모두 저장되었습니다.")
+    print("혼동 행렬 시각화가 모두 저장되었습니다.")
     plt.show()
 
 
