@@ -1,8 +1,13 @@
-"""DANN 학습 스크립트 (단일 백본, 5채널 동기화 입력).
+"""AdaBN 학습 스크립트 (단일 백본, 5채널 동기화 입력).
 
-Gradient Reversal Layer 기반 adversarial domain adaptation 으로 Source(Samsung1)
-라벨만 사용해 Target(Samsung2) 운동 분류 성능을 끌어올린다. Source val 기준으로
-best 모델을 저장해 model selection leakage 를 방지한다.
+Source(Samsung1) 라벨만 사용해 운동 분류기를 학습한다.
+동시에 매 iteration마다 Target(Samsung2) train 데이터를 라벨 없이 forward 하여
+BatchNorm running statistics 를 target 분포에 지속적으로 적응시킨다.
+
+이 스크립트는 DANN 에서 domain discriminator 와 GRL 을 제거한 비교군이다.
+기존 DANN 의 source/target 분리 forward 구조 중 target forward 에 의한
+implicit AdaBN 효과만 남겨, target 성능 향상이 BatchNorm adaptation 만으로
+얼마나 발생하는지 확인한다.
 """
 import os
 import sys
@@ -19,38 +24,37 @@ from tqdm import tqdm
 # 프로젝트 루트 경로 추가
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data_loader import get_dataloaders
-from DANN_model import DANNModel
+from AdaBN_model_iter import AdaBNModel
 
 
-def train_dann():
+def train_adabn():
     # ----------------------------------------------------------------------
     # 하이퍼파라미터 및 환경 설정
     # ----------------------------------------------------------------------
     BATCH_SIZE = 64
-    EPOCHS = 30  # DANN 은 적대적 학습이라 비교적 길게 학습한다.
+    EPOCHS = 30
     LEARNING_RATE = 1e-3
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     os.makedirs('weights', exist_ok=True)
     os.makedirs('results', exist_ok=True)
-    save_path = 'weights/dann_best_model.pth'
+    save_path = 'weights/adabn_iter_best_model.pth'
 
     # 데이터 로더 (Source/Target 의 train/val 4분할)
     train_loader, val_loader, tgt_train_loader, tgt_val_loader, num_classes, le = get_dataloaders(batch_size=BATCH_SIZE)
     class_names = le.classes_
 
     # 모델 선언 (EMG 2ch + IMU 3ch = 5채널 입력)
-    model = DANNModel(in_channels=5, num_classes=num_classes).to(DEVICE)
+    model = AdaBNModel(in_channels=5, num_classes=num_classes).to(DEVICE)
 
     # 손실 함수
     criterion_class = nn.CrossEntropyLoss(label_smoothing=0.1)  # 운동 분류용
-    criterion_domain = nn.CrossEntropyLoss()                    # 도메인 분류용 (Source vs Target)
 
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
     scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
     print("\n" + "=" * 50)
-    print("DANN Adversarial Training Start")
+    print("AdaBN Iteration-wise Training Start")
     print(f"Targeting {num_classes} classes on {DEVICE}")
     print("=" * 50)
 
@@ -67,51 +71,33 @@ def train_dann():
         len_dataloader = min(len(train_loader), len(tgt_train_loader))
         data_zip = zip(train_loader, tgt_train_loader)
 
-        total_loss, total_c_loss, total_d_loss = 0, 0, 0
-
-        # GRL 의 alpha 스케줄링 (0 -> 1 로 점진 증가)
-        p = float(epoch) / EPOCHS
-        alpha = 2. / (1. + np.exp(-10 * p)) - 1
+        total_loss = 0.0
 
         pbar = tqdm(enumerate(data_zip), total=len_dataloader, desc=f"Epoch [{epoch+1:02d}/{EPOCHS:02d}]")
 
         for i, ((src_x, src_y), (tgt_x, tgt_y)) in pbar:
             src_x, src_y = src_x.to(DEVICE), src_y.to(DEVICE)
-            tgt_x, tgt_y = tgt_x.to(DEVICE), tgt_y.to(DEVICE)
+            tgt_x = tgt_x.to(DEVICE)
 
             optimizer.zero_grad()
 
-            # Step 1. Source 데이터 (운동 분류 + 도메인 분류)
-            src_domain_label = torch.zeros(src_x.size(0), dtype=torch.long).to(DEVICE)
-            src_class_out, src_domain_out = model(src_x, alpha=alpha)
+            # Step 1. Source 데이터로 운동 분류 학습
+            src_class_out = model(src_x)
+            class_loss = criterion_class(src_class_out, src_y)
 
-            loss_s_label = criterion_class(src_class_out, src_y)
-            loss_s_domain = criterion_domain(src_domain_out, src_domain_label)
+            # Step 2. Target 데이터는 라벨 없이 forward 만 수행
+            # model.train() 상태이므로 BatchNorm running statistics 가 target 분포를 반영한다.
+            with torch.no_grad():
+                _ = model(tgt_x)
 
-            # Step 2. Target 데이터 (도메인 분류만, UDA 라 라벨 미사용)
-            tgt_domain_label = torch.ones(tgt_x.size(0), dtype=torch.long).to(DEVICE)
-            tgt_class_out, tgt_domain_out = model(tgt_x, alpha=alpha)
-
-            loss_t_domain = criterion_domain(tgt_domain_out, tgt_domain_label)
-            # SDA 설정에서는 아래 줄로 Target 라벨도 학습한다.
-            # loss_t_label = criterion_class(tgt_class_out, tgt_y)
-
-            # Step 3. 통합 손실 계산 및 역전파
-            domain_loss = loss_s_domain + loss_t_domain
-            class_loss = loss_s_label
-
-            loss = class_loss + domain_loss
-            loss.backward()
+            # Step 3. Source classification loss 만 역전파
+            class_loss.backward()
             optimizer.step()
 
-            total_loss += loss.item()
-            total_c_loss += class_loss.item()
-            total_d_loss += domain_loss.item()
+            total_loss += class_loss.item()
 
             pbar.set_postfix({
-                'Total': f"{loss.item():.4f}",
-                'Class': f"{class_loss.item():.4f}",
-                'Domain': f"{domain_loss.item():.4f}"
+                'Class': f"{class_loss.item():.4f}"
             })
 
         scheduler.step()
@@ -124,17 +110,17 @@ def train_dann():
         with torch.no_grad():
             for vx, vy in val_loader:
                 vx = vx.to(DEVICE)
-                out, _ = model(vx, alpha=alpha)
+                out = model(vx)
                 val_preds.extend(out.max(1)[1].cpu().numpy())
                 val_targets.extend(vy.numpy())
         val_acc = accuracy_score(val_targets, val_preds) * 100
 
-        # Target validation 평가 (model selection leakage 방지를 위해 저장 기준에서 제외)
+        # Target validation 평가
         tgt_preds, tgt_targets = [], []
         with torch.no_grad():
             for tx, ty in tgt_val_loader:
                 tx = tx.to(DEVICE)
-                out, _ = model(tx, alpha=alpha)
+                out = model(tx)
                 tgt_preds.extend(out.max(1)[1].cpu().numpy())
                 tgt_targets.extend(ty.numpy())
         tgt_acc = accuracy_score(tgt_targets, tgt_preds) * 100
@@ -149,11 +135,9 @@ def train_dann():
         best_mark = "  (best)" if is_best else ""
         print(
             f"Epoch [{epoch+1:02d}/{EPOCHS:02d}] | "
-            f"Class: {total_c_loss/len_dataloader:.4f} | "
-            f"Domain: {total_d_loss/len_dataloader:.4f} | "
+            f"Class: {total_loss/len_dataloader:.4f} | "
             f"Source Val: {val_acc:.2f}% | "
-            f"Target Val: {tgt_acc:.2f}% | "
-            f"Alpha: {alpha:.3f}"
+            f"Target Val: {tgt_acc:.2f}%"
             f"{best_mark}"
         )
 
@@ -165,7 +149,7 @@ def train_dann():
     print("=" * 50)
 
     # 최고 성능 모델 로드
-    model.load_state_dict(torch.load(save_path))
+    model.load_state_dict(torch.load(save_path, map_location=DEVICE))
     model.eval()
 
     print(
@@ -181,19 +165,19 @@ def train_dann():
     with torch.no_grad():
         for vx, vy in val_loader:
             vx = vx.to(DEVICE)
-            out, _ = model(vx, alpha=1.0)
+            out = model(vx)
             v_preds_final.extend(out.max(1)[1].cpu().numpy())
             v_true_final.extend(vy.numpy())
 
     cm_val = confusion_matrix(v_true_final, v_preds_final)
     plt.figure(figsize=(12, 10))
     sns.heatmap(cm_val, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
-    plt.title(f'DANN (UDA) Source Prediction\n(Val Acc: {best_val_acc:.1f}%)', fontsize=16)
+    plt.title(f'AdaBN Iter Source Prediction\n(Val Acc: {best_val_acc:.1f}%)', fontsize=16)
     plt.xlabel('Predicted Label', fontsize=12)
     plt.ylabel('True Label', fontsize=12)
     plt.xticks(rotation=45)
     plt.tight_layout()
-    plt.savefig('results/dann_source_confusion_matrix.png', dpi=300)
+    plt.savefig('results/adabn_iter_source_confusion_matrix.png', dpi=300)
     plt.close()
 
     # Target 도메인(unseen validation) confusion matrix
@@ -202,22 +186,22 @@ def train_dann():
     with torch.no_grad():
         for tx, ty in tgt_val_loader:
             tx = tx.to(DEVICE)
-            out, _ = model(tx, alpha=1.0)
+            out = model(tx)
             t_preds_final.extend(out.max(1)[1].cpu().numpy())
             t_true_final.extend(ty.numpy())
 
     cm_tgt = confusion_matrix(t_true_final, t_preds_final)
     plt.figure(figsize=(12, 10))
     sns.heatmap(cm_tgt, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
-    plt.title(f'DANN (UDA) Target Prediction\n(Source Val: {best_val_acc:.1f}% vs Target: {best_target_acc:.1f}%)', fontsize=16)
+    plt.title(f'AdaBN Iter Target Prediction\n(Source Val: {best_val_acc:.1f}% vs Target: {best_target_acc:.1f}%)', fontsize=16)
     plt.xlabel('Predicted Label', fontsize=12)
     plt.ylabel('True Label', fontsize=12)
     plt.xticks(rotation=45)
     plt.tight_layout()
-    plt.savefig('results/dann_target_confusion_matrix.png', dpi=300)
+    plt.savefig('results/adabn_iter_target_confusion_matrix.png', dpi=300)
     print("혼동 행렬 시각화가 모두 저장되었습니다.")
     plt.show()
 
 
 if __name__ == "__main__":
-    train_dann()
+    train_adabn()
