@@ -12,6 +12,7 @@ import argparse
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
@@ -31,30 +32,28 @@ RESULT_DIR = os.path.join(PROJECT_ROOT, "results")
 # CORAL 손실
 # ----------------------------------------------------------------------
 def coral_loss(source, target):
-    """Source/Target feature 의 공분산 행렬 차이를 측정한다 (DeepCORAL 손실).
+    """DeepCORAL 손실: L2 정규화된 feature의 공분산(상관) 행렬 차이.
 
-    DeepCORAL 원 논문 공식 그대로 ||C_S - C_T||_F^2 / (4 * d^2) 를 쓴다.
-    제곱 Frobenius norm 을 사용해야 1/(4d^2) 정규화 상수와 스케일이 맞는다.
+    L2 normalize 후 계산하므로 공분산 행렬 원소가 [-1,1]로 bound되고
+    loss 스케일이 [0,1]로 유지되어 CE loss와 비례가 맞는다.
     """
     d = source.size(1)
     n_s = source.size(0)
     n_t = target.size(0)
 
-    src_mean = torch.mean(source, 0, keepdim=True)
+    src_mean = source.mean(0, keepdim=True)
     src_cov = (source - src_mean).t() @ (source - src_mean) / (n_s - 1)
 
-    tgt_mean = torch.mean(target, 0, keepdim=True)
+    tgt_mean = target.mean(0, keepdim=True)
     tgt_cov = (target - tgt_mean).t() @ (target - tgt_mean) / (n_t - 1)
 
-    # 제곱 Frobenius norm = 원소별 제곱 합
-    loss = (src_cov - tgt_cov).pow(2).sum()
-    return loss / (4 * d * d)
+    return (src_cov - tgt_cov).pow(2).sum() / d
 
 
 # ----------------------------------------------------------------------
 # 단일 seed 학습
 # ----------------------------------------------------------------------
-def train_coral(seed=42, epochs=30, batch_size=64, lr=1e-3, lambda_coral=0.5, save_cm=True):
+def train_coral(seed=42, epochs=30, batch_size=64, lr=1e-3, lambda_coral=1.0, save_cm=True):
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -166,7 +165,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--lambda_coral", type=float, default=0.5)
+    parser.add_argument("--lambda_coral", type=float, default=1.0)
     parser.add_argument("--no_cm", action="store_true")
     return parser.parse_args()
 

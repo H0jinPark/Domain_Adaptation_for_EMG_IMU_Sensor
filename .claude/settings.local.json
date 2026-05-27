@@ -3,7 +3,9 @@
     "allow": [
       "Bash(conda env *)",
       "Bash(conda clean *)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(Get-Content \"C:\\\\Users\\\\akska\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-akska-Research-Domain-Adaptation-for-EMG-IMU-Sensor\\\\1f4e66c2-fc08-4c01-be78-2f047aec823c\\\\tasks\\\\b335pohmk.output\")",
+      "Bash(Select-Object -Last 5)"
     ]
   }
 }
