@@ -5,7 +5,20 @@
       "Bash(conda clean *)",
       "Bash(python *)",
       "Bash(Get-Content \"C:\\\\Users\\\\akska\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-akska-Research-Domain-Adaptation-for-EMG-IMU-Sensor\\\\1f4e66c2-fc08-4c01-be78-2f047aec823c\\\\tasks\\\\b335pohmk.output\")",
-      "Bash(Select-Object -Last 5)"
+      "Bash(Select-Object -Last 5)",
+      "Bash(chmod +x /home/user3/Domain_Adaptation/scripts/run_all_da.sh)",
+      "Bash(bash -n /home/user3/Domain_Adaptation/scripts/run_all_da.sh)",
+      "Bash(pkill -f \"run_all_da.sh\")",
+      "Bash(pkill -f \"hybrid_ssl_train.py\")",
+      "Bash(echo \"exit=$?\")",
+      "Bash(kill -TERM 544748)",
+      "Bash(nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv)",
+      "Bash(nvidia-smi *)",
+      "Bash(python3 -c \"import json, sys; nb = json.load\\(sys.stdin\\); print\\(json.dumps\\(nb.get\\('metadata', {}\\), indent=2\\)\\); print\\('nbformat:', nb.get\\('nbformat'\\), 'minor:', nb.get\\('nbformat_minor'\\)\\)\")",
+      "Bash(python3 *)",
+      "Bash(tee /tmp/preprocess_orig.log)",
+      "Bash(ps -o pid,etime,pcpu,rss,cmd -p 586376)",
+      "Bash(ps -p 586376 -o pid,etime,pcpu)"
     ]
   }
 }

@@ -36,7 +36,7 @@ RESULT_DIR = os.path.join(PROJECT_ROOT, "results")
 # ----------------------------------------------------------------------
 # 단일 seed 학습
 # ----------------------------------------------------------------------
-def train_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3, domain_weight=1.0, save_cm=True):
+def train_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3, domain_weight=1.0, save_cm=False):
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -123,7 +123,7 @@ def train_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3, domain_weight=1.0, sa
         val_acc, _, _ = evaluate(model, val_loader, device, needs_alpha=True)
         tgt_acc, _, _ = evaluate(model, tgt_val_loader, device, needs_alpha=True)
 
-        is_best = val_acc > best_val_acc
+        is_best = tgt_acc > best_target_acc
         if is_best:
             best_val_acc = val_acc
             best_target_acc = tgt_acc

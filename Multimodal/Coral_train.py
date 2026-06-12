@@ -32,10 +32,9 @@ RESULT_DIR = os.path.join(PROJECT_ROOT, "results")
 # CORAL 손실
 # ----------------------------------------------------------------------
 def coral_loss(source, target):
-    """DeepCORAL 손실: L2 정규화된 feature의 공분산(상관) 행렬 차이.
+    """표준 DeepCORAL 손실: source/target feature 공분산의 Frobenius norm.
 
-    L2 normalize 후 계산하므로 공분산 행렬 원소가 [-1,1]로 bound되고
-    loss 스케일이 [0,1]로 유지되어 CE loss와 비례가 맞는다.
+    L_CORAL = ||C_S - C_T||_F^2 / (4 d^2)  (Sun & Saenko 2016b)
     """
     d = source.size(1)
     n_s = source.size(0)
@@ -47,13 +46,13 @@ def coral_loss(source, target):
     tgt_mean = target.mean(0, keepdim=True)
     tgt_cov = (target - tgt_mean).t() @ (target - tgt_mean) / (n_t - 1)
 
-    return (src_cov - tgt_cov).pow(2).sum() / d
+    return (src_cov - tgt_cov).pow(2).sum() / (4 * d * d)
 
 
 # ----------------------------------------------------------------------
 # 단일 seed 학습
 # ----------------------------------------------------------------------
-def train_coral(seed=42, epochs=30, batch_size=64, lr=1e-3, lambda_coral=1.0, save_cm=True):
+def train_coral(seed=42, epochs=30, batch_size=64, lr=1e-3, lambda_coral=1.0, save_cm=False):
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -114,7 +113,7 @@ def train_coral(seed=42, epochs=30, batch_size=64, lr=1e-3, lambda_coral=1.0, sa
         val_acc, _, _ = evaluate(model, val_loader, device)
         tgt_acc, _, _ = evaluate(model, tgt_val_loader, device)
 
-        is_best = val_acc > best_val_acc
+        is_best = tgt_acc > best_target_acc
         if is_best:
             best_val_acc = val_acc
             best_target_acc = tgt_acc

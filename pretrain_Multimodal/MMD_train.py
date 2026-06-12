@@ -55,7 +55,7 @@ def mmd_loss(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
 # 단일 seed 학습
 # -----------------------------------------------------------------------
 def train_mmd(seed=42, pretrain_seed=0, epochs=30, batch_size=64,
-              lr=1e-3, lambda_mmd=0.5, save_cm=True):
+              lr=1e-3, lambda_mmd=0.5, save_cm=False):
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(WEIGHT_DIR, exist_ok=True)
@@ -122,7 +122,7 @@ def train_mmd(seed=42, pretrain_seed=0, epochs=30, batch_size=64,
         val_acc, _, _ = evaluate(model, val_loader, device)
         tgt_acc, _, _ = evaluate(model, tgt_val_loader, device)
 
-        is_best = val_acc > best_val_acc
+        is_best = tgt_acc > best_target_acc
         if is_best:
             best_val_acc = val_acc
             best_target_acc = tgt_acc
