@@ -18,7 +18,16 @@
       "Bash(python3 *)",
       "Bash(tee /tmp/preprocess_orig.log)",
       "Bash(ps -o pid,etime,pcpu,rss,cmd -p 586376)",
-      "Bash(ps -p 586376 -o pid,etime,pcpu)"
+      "Bash(ps -p 586376 -o pid,etime,pcpu)",
+      "Bash(/home/user1/miniconda3/envs/DA/bin/python *)",
+      "Bash(/home/user1/miniconda3/envs/DA/bin/jupyter nbconvert *)",
+      "Bash(/home/user1/miniconda3/envs/DA/bin/pip list *)",
+      "Bash(/home/user1/miniconda3/bin/jupyter kernelspec *)",
+      "Bash(/home/user1/miniconda3/envs/DA/bin/jupyter kernelspec *)",
+      "Bash(awk '{print $11,$12,$13, \"CPU%=\"$3, \"MEM%=\"$4}')",
+      "Bash(echo \"NBCONVERT_EXIT=$?\")",
+      "Bash(ps -o etime=,pcpu=,rss=,cmd= -C python)",
+      "Bash(awk '{print \"etime_via_ps\", $10, \"cpu%\",$3,\"mem%\",$4}')"
     ]
   }
 }
