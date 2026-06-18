@@ -57,10 +57,26 @@ def get_label_encoder():
 
 
 def load_baseline_model(weights_path, device=None, num_classes=None, in_channels=5):
-    """Source-only baseline_TCN 가중치를 로드해 eval 모드 모델 반환."""
+    """Source-only baseline_TCN(5채널) 가중치를 로드해 eval 모드 모델 반환."""
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_classes = num_classes or len(CLASS_NAMES)
     model = AdvancedBaselineModel(in_channels=in_channels, num_classes=num_classes).to(device)
+    model.load_state_dict(torch.load(weights_path, map_location=device))
+    model.eval()
+    return model
+
+
+def load_mm_model(weights_path, device=None, num_classes=None):
+    """Source-only 멀티모달(InterFusionClassifier) 가중치를 로드해 eval 모드 모델 반환.
+
+    EMG/IMU 분리 입력 (B,2,5000)/(B,3,500) 을 받는 intermediate fusion 모델.
+    forward 는 (class_logits, features) 튜플을 반환한다.
+    """
+    from Multimodal.mm_model import InterFusionClassifier  # noqa: E402
+
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    num_classes = num_classes or len(CLASS_NAMES)
+    model = InterFusionClassifier(num_classes=num_classes).to(device)
     model.load_state_dict(torch.load(weights_path, map_location=device))
     model.eval()
     return model
@@ -118,6 +134,46 @@ def evaluate_accuracy(df, model, *, session_col="csv_filename_l", time_col="Inde
         for i in range(0, len(xb), batch_size):
             out = model(xb[i:i + batch_size].to(device))
             y_pred.extend(out.argmax(1).cpu().numpy())
+        y_true.extend(le.transform(y_s))
+
+    y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
+    acc = accuracy_score(y_true, y_pred) * 100 if len(y_true) else float("nan")
+    return (acc, y_true, y_pred) if return_preds else acc
+
+
+# ── 정확도 (멀티모달 모델 추론) ──────────────────────────────────────────────
+@torch.no_grad()
+def evaluate_accuracy_mm(df, model, *, session_col="csv_filename_l", time_col="Index_Time",
+                         preprocessor=None, device=None, batch_size=256, return_preds=False):
+    """멀티모달 버전 evaluate_accuracy.
+
+    EMG/IMU 를 각자의 레이트로 분리 전처리(MultiModalPreprocessor)한다:
+      EMG (N,2,5000) 1000Hz / IMU (N,3,500) **네이티브 100Hz**.
+    즉 IMU 평가가 MM 모델이 실제로 보는 100Hz 기준으로 수행된다
+    (5채널 evaluate_accuracy 는 IMU 를 1000Hz 로 업샘플해 본다는 점이 다름).
+
+    model.forward(emg, imu) 는 (class_logits, features) 튜플을 반환하므로 [0] 을 쓴다.
+    return_preds=True 면 (acc, y_true, y_pred) 반환.
+    """
+    from data_preprocess_MM_original import MultiModalPreprocessor  # noqa: E402
+
+    device = device or next(model.parameters()).device
+    preprocessor = preprocessor or MultiModalPreprocessor()
+    le = get_label_encoder()
+
+    y_true, y_pred = [], []
+    for _, sess_df in df.groupby(session_col, sort=False):
+        X_emg, X_imu, y_s = preprocessor.process_single_session(sess_df, time_col)
+        if not X_emg:
+            continue
+        emg = np.asarray(X_emg, dtype=np.float32).transpose(0, 2, 1)  # (N, 2, 5000)
+        imu = np.asarray(X_imu, dtype=np.float32).transpose(0, 2, 1)  # (N, 3,  500)
+        emg_t, imu_t = torch.from_numpy(emg), torch.from_numpy(imu)
+        for i in range(0, len(emg_t), batch_size):
+            out = model(emg_t[i:i + batch_size].to(device),
+                        imu_t[i:i + batch_size].to(device))
+            logits = out[0] if isinstance(out, (tuple, list)) else out
+            y_pred.extend(logits.argmax(1).cpu().numpy())
         y_true.extend(le.transform(y_s))
 
     y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
@@ -268,6 +324,24 @@ def evaluate(df_target, model, dtw_reference, *, session_col="csv_filename_l",
             res  = evaluate(df_p, model, ref)
     """
     acc, y_true, _ = evaluate_accuracy(
+        df_target, model, session_col=session_col, time_col=time_col,
+        preprocessor=preprocessor, device=device, batch_size=batch_size,
+        return_preds=True)
+    dtw = compute_dtw(df_target, dtw_reference, session_col=session_col,
+                      time_col=time_col, n_pts=n_pts)
+    return {"accuracy": acc, "dtw": dtw, "n_windows": int(len(y_true))}
+
+
+def evaluate_mm(df_target, model, dtw_reference, *, session_col="csv_filename_l",
+                time_col="Index_Time", n_pts=200, preprocessor=None, device=None,
+                batch_size=256):
+    """멀티모달 버전 evaluate — accuracy 는 MM 모델(IMU 100Hz)로, DTW 는 동일.
+
+    DTW 는 모델과 무관하게 raw IMU 컬럼으로 계산되므로 5채널과 같은 값이 나온다
+    (축 정렬도 측정용). 48 permutation 루프 사용법은 evaluate 와 동일하되
+    evaluate_mm + load_mm_model 을 쓴다.
+    """
+    acc, y_true, _ = evaluate_accuracy_mm(
         df_target, model, session_col=session_col, time_col=time_col,
         preprocessor=preprocessor, device=device, batch_size=batch_size,
         return_preds=True)

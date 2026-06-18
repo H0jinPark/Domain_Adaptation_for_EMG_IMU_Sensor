@@ -23,13 +23,16 @@ WEIGHT_DIR = os.path.join(PROJECT_ROOT, "weights")
 RESULT_DIR = os.path.join(PROJECT_ROOT, "results")
 
 
-def train_no_da(seed=42, epochs=30, batch_size=64, lr=1e-3, save_cm=False):
+def train_no_da(seed=42, epochs=30, batch_size=64, lr=1e-3, save_cm=False, tag=""):
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(WEIGHT_DIR, exist_ok=True)
     os.makedirs(RESULT_DIR, exist_ok=True)
 
-    save_path = os.path.join(WEIGHT_DIR, f"mm_no_da_seed{seed}_best_model.pth")
+    # tag 로 데이터 종류(예: original / aligned)별 체크포인트를 분리 저장한다.
+    # tag 미지정 시 기존 파일명 유지.
+    suffix = f"_{tag}" if tag else ""
+    save_path = os.path.join(WEIGHT_DIR, f"mm_no_da_seed{seed}{suffix}_best_model.pth")
 
     train_loader, val_loader, _, tgt_val_loader, num_classes, le = \
         get_mm_dataloaders(batch_size=batch_size)
@@ -76,7 +79,9 @@ def train_no_da(seed=42, epochs=30, batch_size=64, lr=1e-3, save_cm=False):
         val_acc, _, _ = evaluate(model, val_loader, device, needs_alpha=False)
         tgt_acc, _, _ = evaluate(model, tgt_val_loader, device, needs_alpha=False)
 
-        is_best = tgt_acc > best_target_acc
+        # No-DA(source-only) baseline 이므로 target 라벨을 보지 않고 source val 기준으로
+        # best 체크포인트를 선택한다. target_acc 는 그 시점의 참고값으로만 기록.
+        is_best = val_acc > best_val_acc
         if is_best:
             best_val_acc = val_acc
             best_target_acc = tgt_acc
@@ -98,11 +103,11 @@ def train_no_da(seed=42, epochs=30, batch_size=64, lr=1e-3, save_cm=False):
         _, t_preds, t_true = evaluate(model, tgt_val_loader, device, needs_alpha=False)
         save_confusion_matrix(
             v_true, v_preds, class_names,
-            os.path.join(RESULT_DIR, f"mm_no_da_seed{seed}_source_cm.png"),
+            os.path.join(RESULT_DIR, f"mm_no_da_seed{seed}{suffix}_source_cm.png"),
             f"No-DA MM Source (seed={seed}, Val: {best_val_acc:.1f}%)", cmap="Blues")
         save_confusion_matrix(
             t_true, t_preds, class_names,
-            os.path.join(RESULT_DIR, f"mm_no_da_seed{seed}_target_cm.png"),
+            os.path.join(RESULT_DIR, f"mm_no_da_seed{seed}{suffix}_target_cm.png"),
             f"No-DA MM Target (seed={seed}, Src: {best_val_acc:.1f}% / Tgt: {best_target_acc:.1f}%)",
             cmap="Blues")
         print("혼동 행렬 저장 완료.")
@@ -124,6 +129,8 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--no_cm", action="store_true")
+    parser.add_argument("--tag", type=str, default="",
+                        help="체크포인트/결과 파일명 suffix (예: original, aligned)")
     return parser.parse_args()
 
 
@@ -134,10 +141,11 @@ if __name__ == "__main__":
         for seed in args.seeds:
             results.append(train_no_da(
                 seed=seed, epochs=args.epochs, batch_size=args.batch_size,
-                lr=args.lr, save_cm=not args.no_cm))
+                lr=args.lr, save_cm=not args.no_cm, tag=args.tag))
+        suffix = f"_{args.tag}" if args.tag else ""
         summarize_results(results, method_name="No-DA (Multimodal)",
-                          save_path=os.path.join(RESULT_DIR, "mm_no_da_summary.txt"))
+                          save_path=os.path.join(RESULT_DIR, f"mm_no_da{suffix}_summary.txt"))
     else:
         train_no_da(
             seed=args.seed, epochs=args.epochs, batch_size=args.batch_size,
-            lr=args.lr, save_cm=not args.no_cm)
+            lr=args.lr, save_cm=not args.no_cm, tag=args.tag)

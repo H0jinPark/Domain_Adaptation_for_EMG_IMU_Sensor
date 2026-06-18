@@ -27,7 +27,8 @@
       "Bash(awk '{print $11,$12,$13, \"CPU%=\"$3, \"MEM%=\"$4}')",
       "Bash(echo \"NBCONVERT_EXIT=$?\")",
       "Bash(ps -o etime=,pcpu=,rss=,cmd= -C python)",
-      "Bash(awk '{print \"etime_via_ps\", $10, \"cpu%\",$3,\"mem%\",$4}')"
+      "Bash(awk '{print \"etime_via_ps\", $10, \"cpu%\",$3,\"mem%\",$4}')",
+      "Bash(jobs)"
     ]
   }
 }
