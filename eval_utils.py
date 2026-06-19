@@ -348,3 +348,104 @@ def evaluate_mm(df_target, model, dtw_reference, *, session_col="csv_filename_l"
     dtw = compute_dtw(df_target, dtw_reference, session_col=session_col,
                       time_col=time_col, n_pts=n_pts)
     return {"accuracy": acc, "dtw": dtw, "n_windows": int(len(y_true))}
+
+
+# ── IMU 변환(회전/순열)을 여러 번 평가할 때: EMG 전처리 1회 캐시 ──────────────
+class MMEvalCache:
+    """EMG 전처리를 **1회만** 수행하고, IMU 축 변환(회전/순열)별 정확도를 빠르게 재평가.
+
+    `evaluate_accuracy_mm` 는 호출마다 `process_single_session` 으로 세션을 1000Hz
+    리샘플·EMG 밴드패스·z-score·윈도잉한다 — 48 순열/12 yaw 처럼 IMU 만 바뀌는 스윕에서
+    EMG(와 리샘플)를 매번 다시 도는 게 낭비다. 이 캐시는 세션별로
+
+        · 1000Hz 리샘플 + EMG 밴드패스 + EMG z-score + EMG 윈도우  → **확정 캐시**
+        · 1000Hz 리샘플된 **raw IMU**(z-score 전) + 윈도우 start + 라벨 → 캐시
+
+    를 한 번만 만들고, `accuracy(imu_transform)` 호출 때만 IMU 에 변환을 적용한 뒤
+    per-channel z-score → 10배 다운샘플 윈도우 → 모델 추론을 반복한다.
+
+    수치 동등성: IMU 변환 `f` 가 (T,3) 채널선형(회전 `@R.T` / 순열·부호)이면
+    리샘플(채널별 mean+linear interp)과 가환이라 `f(raw)→리샘플 = f(리샘플(raw))`.
+    따라서 리샘플된 raw IMU 에 `f` 를 적용한 뒤 z-score 해도, 기존 경로(raw 에 `f` 적용
+    →리샘플→z-score)와 같은 결과다. EMG 는 `f` 와 무관하므로 그대로 캐시.
+
+    사용:
+        cache = MMEvalCache(df_tgt, model=model)          # 1회(무거움)
+        acc_raw = cache.accuracy()                         # identity
+        acc_R   = cache.accuracy(lambda a: a @ R.T)        # 회전
+        acc_p   = cache.accuracy(lambda a: a[:, [1,0,2]])  # 순열(YXZ swap)
+    """
+
+    def __init__(self, df, *, model=None, session_col="csv_filename_l",
+                 time_col="Index_Time", device=None, batch_size=256):
+        from data_preprocess_MM_original import (
+            MultiModalPreprocessor, EMG_WINDOW, EMG_STRIDE)
+        from sklearn.preprocessing import StandardScaler
+
+        self.model = model
+        self.device = device or (next(model.parameters()).device
+                                 if model is not None else torch.device("cpu"))
+        self.batch_size = batch_size
+        self.EMG_WINDOW, self.EMG_STRIDE = EMG_WINDOW, EMG_STRIDE
+        pre = MultiModalPreprocessor()
+        self.emg_cols, self.imu_cols = pre.emg_cols, pre.imu_cols
+        self.label_col, self.imu_step = pre.label_col, pre.imu_step
+        le = get_label_encoder()
+
+        self.sessions = []
+        for _, sess_df in df.groupby(session_col, sort=False):
+            sdf = sess_df.sort_values(by=time_col).copy()
+            sdf["datetime"] = pd.to_timedelta(sdf[time_col], unit="s")
+            sdf = sdf.set_index("datetime")
+            num = (sdf[self.emg_cols + self.imu_cols]
+                   .resample("1ms").mean().interpolate("linear"))
+            lab = sdf[[self.label_col]].resample("1ms").ffill()
+            d = pd.concat([num, lab], axis=1).dropna()
+            if len(d) < EMG_WINDOW:
+                continue
+            for c in self.emg_cols:                       # EMG 밴드패스 (변환 무관)
+                d[c] = pre._bandpass_emg(d[c].values)
+            emg = StandardScaler().fit_transform(d[self.emg_cols])   # (T,2) 확정
+            imu_raw = d[self.imu_cols].to_numpy(np.float64)          # (T,3) z-score 전
+            labels = d[self.label_col].values
+            starts = list(range(0, len(d) - EMG_WINDOW + 1, EMG_STRIDE))
+            emg_w, y = [], []
+            for s in starts:
+                emg_w.append(emg[s:s + EMG_WINDOW])
+                u, cnt = np.unique(labels[s:s + EMG_WINDOW], return_counts=True)
+                y.append(u[np.argmax(cnt)])
+            if not emg_w:
+                continue
+            self.sessions.append({
+                "emg": np.asarray(emg_w, np.float32).transpose(0, 2, 1),  # (n,2,5000)
+                "imu_raw": imu_raw,
+                "starts": starts,
+                "y": le.transform(y),
+            })
+        self.n_windows = int(sum(len(s["y"]) for s in self.sessions))
+
+    @torch.no_grad()
+    def accuracy(self, imu_transform=None, *, return_preds=False):
+        """imu_transform: (T,3)->(T,3) (None=identity). 적용 후 z-score→다운샘플→추론한 정확도(%)."""
+        from sklearn.preprocessing import StandardScaler
+
+        if self.model is None:
+            raise ValueError("model 이 없습니다 — MMEvalCache(df, model=...) 로 생성하세요.")
+        step, W = self.imu_step, self.EMG_WINDOW
+        y_true, y_pred = [], []
+        for s in self.sessions:
+            imu = s["imu_raw"] if imu_transform is None \
+                else np.asarray(imu_transform(s["imu_raw"]), np.float64)
+            imu = StandardScaler().fit_transform(imu)                # 변환 후 z-score
+            imu_w = np.asarray([imu[st:st + W:step] for st in s["starts"]],
+                               np.float32).transpose(0, 2, 1)        # (n,3,500)
+            emg_t, imu_t = torch.from_numpy(s["emg"]), torch.from_numpy(imu_w)
+            for i in range(0, len(emg_t), self.batch_size):
+                out = self.model(emg_t[i:i + self.batch_size].to(self.device),
+                                 imu_t[i:i + self.batch_size].to(self.device))
+                logits = out[0] if isinstance(out, (tuple, list)) else out
+                y_pred.extend(logits.argmax(1).cpu().numpy())
+            y_true.extend(s["y"])
+        y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
+        acc = accuracy_score(y_true, y_pred) * 100 if len(y_true) else float("nan")
+        return (acc, y_true, y_pred) if return_preds else acc

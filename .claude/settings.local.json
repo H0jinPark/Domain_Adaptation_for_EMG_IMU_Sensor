@@ -28,7 +28,8 @@
       "Bash(echo \"NBCONVERT_EXIT=$?\")",
       "Bash(ps -o etime=,pcpu=,rss=,cmd= -C python)",
       "Bash(awk '{print \"etime_via_ps\", $10, \"cpu%\",$3,\"mem%\",$4}')",
-      "Bash(jobs)"
+      "Bash(jobs)",
+      "Bash(jupyter nbconvert *)"
     ]
   }
 }
