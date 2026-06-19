@@ -29,7 +29,14 @@
       "Bash(ps -o etime=,pcpu=,rss=,cmd= -C python)",
       "Bash(awk '{print \"etime_via_ps\", $10, \"cpu%\",$3,\"mem%\",$4}')",
       "Bash(jobs)",
-      "Bash(jupyter nbconvert *)"
+      "Bash(jupyter nbconvert *)",
+      "Bash(awk 'NR==1 || /\\\\//{print}')",
+      "Read(//home/user1/**)",
+      "Bash(rm -f Domain_Adaptation_for_EMG_IMU_Sensor.zip)",
+      "Bash(zip -r -0 -q Domain_Adaptation_for_EMG_IMU_Sensor.zip Domain_Adaptation_for_EMG_IMU_Sensor)",
+      "Bash(unzip -t /home/user1/Domain_Adaptation_for_EMG_IMU_Sensor.zip)",
+      "Bash(rm -f /home/user1/Domain_Adaptation_for_EMG_IMU_Sensor/Domain_Adaptation_for_EMG_IMU_Sensor.zip)",
+      "Bash(zip -r -1 -q Domain_Adaptation_for_EMG_IMU_Sensor.zip Domain_Adaptation_for_EMG_IMU_Sensor -x Domain_Adaptation_for_EMG_IMU_Sensor/preprocessed*)"
     ]
   }
 }
