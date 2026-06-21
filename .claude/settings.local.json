@@ -36,7 +36,8 @@
       "Bash(zip -r -0 -q Domain_Adaptation_for_EMG_IMU_Sensor.zip Domain_Adaptation_for_EMG_IMU_Sensor)",
       "Bash(unzip -t /home/user1/Domain_Adaptation_for_EMG_IMU_Sensor.zip)",
       "Bash(rm -f /home/user1/Domain_Adaptation_for_EMG_IMU_Sensor/Domain_Adaptation_for_EMG_IMU_Sensor.zip)",
-      "Bash(zip -r -1 -q Domain_Adaptation_for_EMG_IMU_Sensor.zip Domain_Adaptation_for_EMG_IMU_Sensor -x Domain_Adaptation_for_EMG_IMU_Sensor/preprocessed*)"
+      "Bash(zip -r -1 -q Domain_Adaptation_for_EMG_IMU_Sensor.zip Domain_Adaptation_for_EMG_IMU_Sensor -x Domain_Adaptation_for_EMG_IMU_Sensor/preprocessed*)",
+      "Bash(xargs -n1 basename)"
     ]
   }
 }
