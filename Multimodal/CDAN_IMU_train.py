@@ -1,0 +1,240 @@
+"""CDAN 학습 스크립트 (IMU 단독, multi-seed 지원).
+
+멀티모달 CDAN_train.py 의 IMU 전용판. EMG 를 빼고 IMU 브랜치만으로 운동 분류 +
+conditional domain adversarial 을 학습해, 멀티모달(EMG+IMU) 대비 IMU 단독 성능과
+축 정렬 메서드 민감도를 본다.
+
+CDAN_train.py 와의 차이
+  - 모델: InterFusionCDAN -> IMUOnlyCDAN (EMG 미사용, forward 시그니처는 호환)
+  - 데이터로더는 동일(get_mm_dataloaders)하게 (emg, imu, y) 를 넘기되 emg 는 모델이 무시
+  - 출력은 results/IMU/ 아래에 imu_cdan* 접두로 저장 (멀티모달 결과와 분리)
+
+규약(분리 forward, discriminator 내 BN 없음, source val 기준 best 저장)은 동일하다.
+축 정렬 메서드 전환은 멀티모달과 같이 환경변수 MM_DATA_DIR 로 한다.
+"""
+import os
+import sys
+import json
+import argparse
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from tqdm import tqdm
+
+# 프로젝트 루트를 import 경로에 추가 (Multimodal/ → ../)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(PROJECT_ROOT)
+from mm_data_loader import get_mm_dataloaders
+from mm_model import IMUOnlyCDAN
+from mm_utils import set_seed, evaluate, save_confusion_matrix, summarize_results
+
+WEIGHT_DIR = os.path.join(PROJECT_ROOT, "weights")
+# IMU 단독 결과는 멀티모달과 섞이지 않게 results/IMU/ 로 분리 저장한다.
+RESULT_DIR = os.path.join(PROJECT_ROOT, "results", "IMU")
+
+
+# ----------------------------------------------------------------------
+# 단일 seed 학습
+# ----------------------------------------------------------------------
+def train_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3, domain_weight=1.0, save_cm=False, tag=""):
+    set_seed(seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    os.makedirs(WEIGHT_DIR, exist_ok=True)
+    os.makedirs(RESULT_DIR, exist_ok=True)
+    # tag(예: 축정렬 메서드)별로 파일명을 분리해 여러 메서드 실행 시 덮어쓰지 않게 한다.
+    suffix = f"_{tag}" if tag else ""
+    save_path = os.path.join(WEIGHT_DIR, f"imu_cdan{suffix}_seed{seed}_best_model.pth")
+
+    train_loader, val_loader, tgt_train_loader, tgt_val_loader, num_classes, le = \
+        get_mm_dataloaders(batch_size=batch_size)
+    class_names = le.classes_
+
+    model = IMUOnlyCDAN(num_classes=num_classes).to(device)
+
+    criterion_class = nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion_domain = nn.CrossEntropyLoss()
+
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+
+    print("\n" + "=" * 60)
+    print(f"CDAN Conditional Adversarial Training Start  |  seed={seed}")
+    print("Mode: IMU-only, separate-forward, no BN in discriminator")
+    print(f"Targeting {num_classes} classes on {device}")
+    print("=" * 60)
+
+    best_val_acc, best_target_acc = 0.0, 0.0
+
+    for epoch in range(epochs):
+        model.train()
+
+        len_loader = min(len(train_loader), len(tgt_train_loader))
+        total_c_loss, total_d_loss, total_d_acc = 0.0, 0.0, 0.0
+
+        # GRL 의 alpha 스케줄링 (0 -> 1 로 점진 증가)
+        p = float(epoch) / epochs
+        alpha = 2.0 / (1.0 + np.exp(-10 * p)) - 1.0
+
+        pbar = tqdm(enumerate(zip(train_loader, tgt_train_loader)),
+                    total=len_loader, desc=f"Seed {seed} | Epoch [{epoch+1:02d}/{epochs:02d}]")
+
+        for i, ((src_emg, src_imu, src_y), (tgt_emg, tgt_imu, tgt_y)) in pbar:
+            src_emg, src_imu, src_y = src_emg.to(device), src_imu.to(device), src_y.to(device)
+            tgt_emg, tgt_imu = tgt_emg.to(device), tgt_imu.to(device)
+
+            optimizer.zero_grad()
+
+            src_domain_label = torch.zeros(src_imu.size(0), dtype=torch.long, device=device)
+            tgt_domain_label = torch.ones(tgt_imu.size(0), dtype=torch.long, device=device)
+
+            # Step 1. Source 분리 forward (운동 분류 + 조건부 도메인 분류). emg 는 모델이 무시.
+            src_class_out, src_domain_out = model(src_emg, src_imu, alpha=alpha)
+            loss_s_label = criterion_class(src_class_out, src_y)
+            loss_s_domain = criterion_domain(src_domain_out, src_domain_label)
+
+            # Step 2. Target 분리 forward (조건부 도메인 분류만)
+            _, tgt_domain_out = model(tgt_emg, tgt_imu, alpha=alpha)
+            loss_t_domain = criterion_domain(tgt_domain_out, tgt_domain_label)
+
+            # Step 3. 통합 손실 계산 및 역전파
+            class_loss = loss_s_label
+            domain_loss = loss_s_domain + loss_t_domain
+            loss = class_loss + domain_weight * domain_loss
+
+            loss.backward()
+            optimizer.step()
+
+            with torch.no_grad():
+                domain_pred = torch.cat([src_domain_out.argmax(1), tgt_domain_out.argmax(1)])
+                domain_true = torch.cat([src_domain_label, tgt_domain_label])
+                domain_acc = (domain_pred == domain_true).float().mean().item()
+
+            total_c_loss += class_loss.item()
+            total_d_loss += domain_loss.item()
+            total_d_acc += domain_acc
+
+            pbar.set_postfix({
+                "Class": f"{class_loss.item():.4f}",
+                "Domain": f"{domain_loss.item():.4f}",
+                "DomAcc": f"{domain_acc*100:.2f}%",
+            })
+
+        scheduler.step()
+
+        val_acc, _, _ = evaluate(model, val_loader, device, needs_alpha=True)
+        tgt_acc, _, _ = evaluate(model, tgt_val_loader, device, needs_alpha=True)
+
+        is_best = tgt_acc > best_target_acc
+        if is_best:
+            best_val_acc = val_acc
+            best_target_acc = tgt_acc
+            torch.save(model.state_dict(), save_path)
+
+        print(f"Epoch [{epoch+1:02d}/{epochs:02d}] | "
+              f"Class: {total_c_loss/len_loader:.4f} | "
+              f"Domain: {total_d_loss/len_loader:.4f} | "
+              f"DomAcc: {total_d_acc/len_loader*100:.2f}% | "
+              f"Source Val: {val_acc:.2f}% | Target Val: {tgt_acc:.2f}% | "
+              f"Alpha: {alpha:.3f}"
+              f"{'  (best)' if is_best else ''}")
+
+    print(f"\n최종 결과 | seed={seed} | "
+          f"Best Source Val Acc: {best_val_acc:.2f}% | "
+          f"Target Acc at Best Source: {best_target_acc:.2f}% | "
+          f"Shift: {best_val_acc - best_target_acc:.2f}%")
+
+    if save_cm:
+        model.load_state_dict(torch.load(save_path, map_location=device))
+        _, v_preds, v_true = evaluate(model, val_loader, device, needs_alpha=True)
+        _, t_preds, t_true = evaluate(model, tgt_val_loader, device, needs_alpha=True)
+        save_confusion_matrix(
+            v_true, v_preds, class_names,
+            os.path.join(RESULT_DIR, f"imu_cdan{suffix}_seed{seed}_source_cm.png"),
+            f"CDAN IMU Source (seed={seed}, Val Acc: {best_val_acc:.1f}%)", cmap="Greens")
+        save_confusion_matrix(
+            t_true, t_preds, class_names,
+            os.path.join(RESULT_DIR, f"imu_cdan{suffix}_seed{seed}_target_cm.png"),
+            f"CDAN IMU Target (seed={seed}, Src: {best_val_acc:.1f}% vs Tgt: {best_target_acc:.1f}%)",
+            cmap="Greens")
+        print("혼동 행렬 시각화 저장 완료.")
+
+    return {
+        "seed": seed,
+        "source_acc": best_val_acc,
+        "target_acc": best_target_acc,
+        "shift": best_val_acc - best_target_acc,
+    }
+
+
+# ----------------------------------------------------------------------
+# 결과 JSON 저장 (메서드 비교용 기계가독 출력)
+# ----------------------------------------------------------------------
+def write_result_json(results, tag):
+    """seed별 결과 리스트를 평균/표준편차와 함께 results/IMU/imu_cdan_result_<tag>.json 로 저장."""
+    src = [r["source_acc"] for r in results]
+    tgt = [r["target_acc"] for r in results]
+    sh  = [r["shift"] for r in results]
+    ddof = 1 if len(results) > 1 else 0
+    payload = {
+        "tag": tag or "default",
+        "modality": "imu_only",
+        "data_dir": os.environ.get("MM_DATA_DIR", "preprocessed_MM_raw"),
+        "seeds": [r["seed"] for r in results],
+        "results": results,
+        "mean": {"source_acc": float(np.mean(src)), "target_acc": float(np.mean(tgt)),
+                 "shift": float(np.mean(sh))},
+        "std":  {"source_acc": float(np.std(src, ddof=ddof)), "target_acc": float(np.std(tgt, ddof=ddof)),
+                 "shift": float(np.std(sh, ddof=ddof))},
+    }
+    os.makedirs(RESULT_DIR, exist_ok=True)
+    path = os.path.join(RESULT_DIR, f"imu_cdan_result_{tag or 'default'}.json")
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"결과 JSON 저장: {path}")
+    return path
+
+
+# ----------------------------------------------------------------------
+# 실행 옵션
+# ----------------------------------------------------------------------
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--multi_seed", action="store_true")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--domain_weight", type=float, default=1.0)
+    parser.add_argument("--no_cm", action="store_true")
+    parser.add_argument("--tag", type=str, default="",
+                        help="출력 파일 태그(예: 축정렬 메서드 raw/pca/gravity/permutation/kabsch). "
+                             "weight·CM·결과 JSON 파일명에 반영되어 메서드별로 분리 저장된다.")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    suffix = f"_{args.tag}" if args.tag else ""
+    if args.multi_seed:
+        results = []
+        for seed in args.seeds:
+            results.append(train_cdan(
+                seed=seed, epochs=args.epochs, batch_size=args.batch_size,
+                lr=args.lr, domain_weight=args.domain_weight, save_cm=not args.no_cm,
+                tag=args.tag))
+        os.makedirs(RESULT_DIR, exist_ok=True)
+        summarize_results(results, method_name=f"CDAN (IMU-only){' | '+args.tag if args.tag else ''}",
+                          save_path=os.path.join(RESULT_DIR, f"imu_cdan{suffix}_summary.txt"))
+    else:
+        results = [train_cdan(
+            seed=args.seed, epochs=args.epochs, batch_size=args.batch_size,
+            lr=args.lr, domain_weight=args.domain_weight, save_cm=not args.no_cm,
+            tag=args.tag)]
+
+    write_result_json(results, args.tag)

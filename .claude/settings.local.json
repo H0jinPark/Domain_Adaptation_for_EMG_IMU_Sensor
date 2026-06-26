@@ -39,7 +39,18 @@
       "Bash(zip -r -1 -q Domain_Adaptation_for_EMG_IMU_Sensor.zip Domain_Adaptation_for_EMG_IMU_Sensor -x Domain_Adaptation_for_EMG_IMU_Sensor/preprocessed*)",
       "Bash(xargs -n1 basename)",
       "Bash(cd /Users/hojin/.claude/projects/-Users-hojin-Documents-Domain-Adaptation-for-EMG-IMU-Sensor/memory/)",
-      "Bash(cat MEMORY.md)"
+      "Bash(cat MEMORY.md)",
+      "Bash(grep -vE \"\\\\.\\(py|ipynb\\)$\")",
+      "Bash(mkdir -p Multimodal)",
+      "Bash(mv mm_cdan_* mm_no_da_* cdan_result_*.json cdan_method_comparison.csv cdan_method_comparison.png cdan_source_confusion_matrix.png cdan_target_confusion_matrix.png Multimodal/)",
+      "Bash(grep -vE \"_cm\\\\.png$\")",
+      "Bash(mkdir -p /home/user1/Domain_Adaptation_for_EMG_IMU_Sensor/Learnable_R)",
+      "Bash(touch /home/user1/Domain_Adaptation_for_EMG_IMU_Sensor/Learnable_R/__init__.py)",
+      "Bash(~/miniconda3/envs/DA/bin/python *)",
+      "Bash(conda run *)",
+      "Bash(cd *)",
+      "Bash(python -c ' *)",
+      "Bash(python -)"
     ]
   }
 }

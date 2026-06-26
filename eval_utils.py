@@ -37,7 +37,7 @@ for _p in (_ROOT, os.path.join(_ROOT, "baseline")):
         sys.path.insert(0, _p)
 
 from baseline_model import AdvancedBaselineModel              # noqa: E402
-from data_preprocess_original import DomainAdaptationPreprocessor  # noqa: E402
+from data_preprocess_MM import MultiModalPreprocessor  # noqa: E402
 
 # ── 상수 ──────────────────────────────────────────────────────────────────────
 # 학습 때와 동일하게 알파벳 정렬로 고정된 10개 운동 클래스
@@ -119,8 +119,7 @@ def evaluate_accuracy(df, model, *, session_col="csv_filename_l", time_col="Inde
     return_preds=True 면 (acc, y_true, y_pred) 반환.
     """
     device = device or next(model.parameters()).device
-    preprocessor = preprocessor or DomainAdaptationPreprocessor(
-        out_dir=os.path.join(_ROOT, "preprocessed_original"))
+    preprocessor = preprocessor or MultiModalPreprocessor()
     le = get_label_encoder()
 
     # groupby 1회로 세션 분할 (df[df[col]==sess] 마스킹은 26M행 풀스캔을 세션수만큼 반복 → 병목)
@@ -155,7 +154,7 @@ def evaluate_accuracy_mm(df, model, *, session_col="csv_filename_l", time_col="I
     model.forward(emg, imu) 는 (class_logits, features) 튜플을 반환하므로 [0] 을 쓴다.
     return_preds=True 면 (acc, y_true, y_pred) 반환.
     """
-    from data_preprocess_MM_original import MultiModalPreprocessor  # noqa: E402
+    from data_preprocess_MM import MultiModalPreprocessor  # noqa: E402
 
     device = device or next(model.parameters()).device
     preprocessor = preprocessor or MultiModalPreprocessor()
@@ -378,7 +377,7 @@ class MMEvalCache:
 
     def __init__(self, df, *, model=None, session_col="csv_filename_l",
                  time_col="Index_Time", device=None, batch_size=256):
-        from data_preprocess_MM_original import (
+        from data_preprocess_MM import (
             MultiModalPreprocessor, EMG_WINDOW, EMG_STRIDE)
         from sklearn.preprocessing import StandardScaler
 

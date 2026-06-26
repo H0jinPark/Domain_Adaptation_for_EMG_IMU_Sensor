@@ -17,10 +17,12 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import LabelEncoder
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# 기본값 = preprocessed_MM_original (samsung1 → samsung2_original, raw/unaligned 주력 실험).
-# 옛 aligned 데이터로 돌리려면 MM_DATA_DIR=preprocessed_MM 로 환경변수 지정.
+# 기본값 = preprocessed_MM_raw (samsung1 → samsung2 raw 원본, R=eye, 정렬 없음).
+# 축 정렬 방법별 데이터로 돌리려면 환경변수로 폴더 지정:
+#   MM_DATA_DIR=preprocessed_MM_pca | preprocessed_MM_gravity |
+#               preprocessed_MM_permutation | preprocessed_MM_kabsch
 DATA_DIR = os.path.join(PROJECT_ROOT,
-                        os.environ.get("MM_DATA_DIR", "preprocessed_MM_original"))
+                        os.environ.get("MM_DATA_DIR", "preprocessed_MM_raw"))
 
 
 # ----------------------------------------------------------------------

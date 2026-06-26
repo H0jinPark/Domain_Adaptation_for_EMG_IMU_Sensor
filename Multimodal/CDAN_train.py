@@ -11,6 +11,7 @@ Target(Samsung2) 운동 분류 성능을 끌어올린다.
 """
 import os
 import sys
+import json
 import argparse
 
 import numpy as np
@@ -34,13 +35,15 @@ RESULT_DIR = os.path.join(PROJECT_ROOT, "results")
 # ----------------------------------------------------------------------
 # 단일 seed 학습
 # ----------------------------------------------------------------------
-def train_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3, domain_weight=1.0, save_cm=False):
+def train_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3, domain_weight=1.0, save_cm=False, tag=""):
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     os.makedirs(WEIGHT_DIR, exist_ok=True)
     os.makedirs(RESULT_DIR, exist_ok=True)
-    save_path = os.path.join(WEIGHT_DIR, f"mm_cdan_seed{seed}_best_model.pth")
+    # tag(예: 축정렬 메서드)별로 파일명을 분리해 여러 메서드 실행 시 덮어쓰지 않게 한다.
+    suffix = f"_{tag}" if tag else ""
+    save_path = os.path.join(WEIGHT_DIR, f"mm_cdan{suffix}_seed{seed}_best_model.pth")
 
     train_loader, val_loader, tgt_train_loader, tgt_val_loader, num_classes, le = \
         get_mm_dataloaders(batch_size=batch_size)
@@ -146,11 +149,11 @@ def train_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3, domain_weight=1.0, sa
         _, t_preds, t_true = evaluate(model, tgt_val_loader, device, needs_alpha=True)
         save_confusion_matrix(
             v_true, v_preds, class_names,
-            os.path.join(RESULT_DIR, f"mm_cdan_seed{seed}_source_cm.png"),
+            os.path.join(RESULT_DIR, f"mm_cdan{suffix}_seed{seed}_source_cm.png"),
             f"CDAN MM Source (seed={seed}, Val Acc: {best_val_acc:.1f}%)", cmap="Purples")
         save_confusion_matrix(
             t_true, t_preds, class_names,
-            os.path.join(RESULT_DIR, f"mm_cdan_seed{seed}_target_cm.png"),
+            os.path.join(RESULT_DIR, f"mm_cdan{suffix}_seed{seed}_target_cm.png"),
             f"CDAN MM Target (seed={seed}, Src: {best_val_acc:.1f}% vs Tgt: {best_target_acc:.1f}%)",
             cmap="Purples")
         print("혼동 행렬 시각화 저장 완료.")
@@ -161,6 +164,33 @@ def train_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3, domain_weight=1.0, sa
         "target_acc": best_target_acc,
         "shift": best_val_acc - best_target_acc,
     }
+
+
+# ----------------------------------------------------------------------
+# 결과 JSON 저장 (메서드 비교용 기계가독 출력)
+# ----------------------------------------------------------------------
+def write_result_json(results, tag):
+    """seed별 결과 리스트를 평균/표준편차와 함께 results/cdan_result_<tag>.json 로 저장."""
+    src = [r["source_acc"] for r in results]
+    tgt = [r["target_acc"] for r in results]
+    sh  = [r["shift"] for r in results]
+    ddof = 1 if len(results) > 1 else 0
+    payload = {
+        "tag": tag or "default",
+        "data_dir": os.environ.get("MM_DATA_DIR", "preprocessed_MM_raw"),
+        "seeds": [r["seed"] for r in results],
+        "results": results,
+        "mean": {"source_acc": float(np.mean(src)), "target_acc": float(np.mean(tgt)),
+                 "shift": float(np.mean(sh))},
+        "std":  {"source_acc": float(np.std(src, ddof=ddof)), "target_acc": float(np.std(tgt, ddof=ddof)),
+                 "shift": float(np.std(sh, ddof=ddof))},
+    }
+    path = os.path.join(RESULT_DIR, f"cdan_result_{tag or 'default'}.json")
+    os.makedirs(RESULT_DIR, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"결과 JSON 저장: {path}")
+    return path
 
 
 # ----------------------------------------------------------------------
@@ -176,21 +206,29 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--domain_weight", type=float, default=1.0)
     parser.add_argument("--no_cm", action="store_true")
+    parser.add_argument("--tag", type=str, default="",
+                        help="출력 파일 태그(예: 축정렬 메서드 raw/pca/gravity/permutation/kabsch). "
+                             "weight·CM·결과 JSON 파일명에 반영되어 메서드별로 분리 저장된다.")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
+    suffix = f"_{args.tag}" if args.tag else ""
     if args.multi_seed:
         results = []
         for seed in args.seeds:
             results.append(train_cdan(
                 seed=seed, epochs=args.epochs, batch_size=args.batch_size,
-                lr=args.lr, domain_weight=args.domain_weight, save_cm=not args.no_cm))
-        summarize_results(results, method_name="CDAN (Multimodal)",
-                          save_path=os.path.join(RESULT_DIR, "mm_cdan_summary.txt"))
+                lr=args.lr, domain_weight=args.domain_weight, save_cm=not args.no_cm,
+                tag=args.tag))
+        summarize_results(results, method_name=f"CDAN (Multimodal){' | '+args.tag if args.tag else ''}",
+                          save_path=os.path.join(RESULT_DIR, f"mm_cdan{suffix}_summary.txt"))
     else:
-        train_cdan(
+        results = [train_cdan(
             seed=args.seed, epochs=args.epochs, batch_size=args.batch_size,
-            lr=args.lr, domain_weight=args.domain_weight, save_cm=not args.no_cm)
+            lr=args.lr, domain_weight=args.domain_weight, save_cm=not args.no_cm,
+            tag=args.tag)]
+
+    write_result_json(results, args.tag)
