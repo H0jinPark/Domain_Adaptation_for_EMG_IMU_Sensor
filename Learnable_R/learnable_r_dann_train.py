@@ -233,7 +233,11 @@ def train(seed=42, epochs=60, batch_size=64, lr=1e-3, r_lr=1e-2,
           aug_angle=15.0, freeze_encoder=False, phase1_epochs=15, post_r_norm="none",
           domain="dann", grad_clip=5.0, save_cm=False, tag=""):
     set_seed(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        "cuda" if torch.cuda.is_available()
+        else "mps" if getattr(torch.backends, "mps", None) is not None
+        and torch.backends.mps.is_available()
+        else "cpu")
 
     os.makedirs(WEIGHT_DIR, exist_ok=True)
     os.makedirs(RESULT_DIR, exist_ok=True)

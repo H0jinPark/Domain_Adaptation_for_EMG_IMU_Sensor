@@ -50,7 +50,19 @@
       "Bash(conda run *)",
       "Bash(cd *)",
       "Bash(python -c ' *)",
-      "Bash(python -)"
+      "Bash(python -)",
+      "Bash(git show *)",
+      "Read(//tmp/**)",
+      "Bash(git stash *)",
+      "Bash(git merge *)",
+      "Bash(echo \"=== exit: $? ===\")",
+      "Bash(git add *)",
+      "Bash(/Users/hojin/miniconda3/envs/DA/bin/python -)",
+      "Bash(md5 -q data/samsung2.parquet data/samsung2_original.parquet)",
+      "Bash(mv -f data/samsung2_original.parquet data/samsung2.parquet)",
+      "Bash(md5 -q data/samsung2.parquet)",
+      "Bash(awk '{print $6,$7,$8,$9}')",
+      "Bash(/Users/hojin/miniconda3/envs/DA/bin/python -c \"import koreanize_matplotlib; print\\('koreanize_matplotlib OK', koreanize_matplotlib.__version__ if hasattr\\(koreanize_matplotlib,'__version__'\\) else ''\\)\")"
     ]
   }
 }

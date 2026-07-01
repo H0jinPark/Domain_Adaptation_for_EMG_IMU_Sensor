@@ -152,7 +152,9 @@ def pca_frame(x):
     cov = torch.einsum("bct,bdt->bcd", xc, xc) / T    # (B,3,3) 샘플별 공분산
     cov = cov.mean(dim=0)                             # (3,3) 배치평균
     cov = cov + 1e-6 * torch.eye(3, device=x.device, dtype=x.dtype)  # eigh 안정 jitter
-    _, evecs = torch.linalg.eigh(cov)                 # 고윳값 오름차순
+    # MPS 는 linalg.eigh 미구현 → 3x3 분해는 CPU 에서(비용 무시 가능), 결과만 원 device 로.
+    _, evecs = torch.linalg.eigh(cov.cpu())           # 고윳값 오름차순
+    evecs = evecs.to(x.device)
     F = evecs.flip(1)                                 # 내림차순 (col0=최대분산축)
     proj = torch.einsum("bct,ck->bkt", xc, F)         # (B,3,T) 각 주축 투영
     sign = torch.sign((proj ** 3).sum(dim=(0, 2)))    # (3,) 왜도 부호
@@ -160,7 +162,7 @@ def pca_frame(x):
     F = F * sign.unsqueeze(0)                         # (3,3) 열별 부호고정
     # proper rotation 보장(det=+1): 부호고정이 핸디드니스를 뒤집으면 최소분산축 반전.
     # source/target 둘 다 det +1 이라야 정렬 R=Fs Ftᵀ 가 회전이 되어 rotation reg 와 안 싸움.
-    if torch.det(F) < 0:
+    if torch.det(F.cpu()) < 0:
         F = torch.cat([F[:, :2], -F[:, 2:3]], dim=1)
     return F
 
