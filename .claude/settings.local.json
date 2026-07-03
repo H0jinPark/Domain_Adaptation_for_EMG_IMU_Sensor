@@ -62,7 +62,13 @@
       "Bash(mv -f data/samsung2_original.parquet data/samsung2.parquet)",
       "Bash(md5 -q data/samsung2.parquet)",
       "Bash(awk '{print $6,$7,$8,$9}')",
-      "Bash(/Users/hojin/miniconda3/envs/DA/bin/python -c \"import koreanize_matplotlib; print\\('koreanize_matplotlib OK', koreanize_matplotlib.__version__ if hasattr\\(koreanize_matplotlib,'__version__'\\) else ''\\)\")"
+      "Bash(/Users/hojin/miniconda3/envs/DA/bin/python -c \"import koreanize_matplotlib; print\\('koreanize_matplotlib OK', koreanize_matplotlib.__version__ if hasattr\\(koreanize_matplotlib,'__version__'\\) else ''\\)\")",
+      "Bash(git rm *)",
+      "Bash(rm -f __pycache__/learnable_r_train.cpython-310.pyc __pycache__/learnable_r_cl_train.cpython-310.pyc __pycache__/learnable_r_mmd_train.cpython-310.pyc)",
+      "Bash(git mv *)",
+      "Bash(python3 -c \"import json; d=json.load\\(open\\('results/Learnable_R/learnable_r_cdan_result_free_g1.json'\\)\\); print\\('mean:',d['mean']\\); print\\('std:',d['std']\\); print\\('per-seed:',[\\(r['seed'],round\\(r['target_acc'],1\\)\\) for r in d['results']]\\)\")",
+      "Bash(rm Learnable_R/learnable_r_cdan_stablepca_train.py)",
+      "Bash(rm -rf Learnable_R/__pycache__/*stablepca*)"
     ]
   }
 }
