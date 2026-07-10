@@ -68,7 +68,8 @@
       "Bash(git mv *)",
       "Bash(python3 -c \"import json; d=json.load\\(open\\('results/Learnable_R/learnable_r_cdan_result_free_g1.json'\\)\\); print\\('mean:',d['mean']\\); print\\('std:',d['std']\\); print\\('per-seed:',[\\(r['seed'],round\\(r['target_acc'],1\\)\\) for r in d['results']]\\)\")",
       "Bash(rm Learnable_R/learnable_r_cdan_stablepca_train.py)",
-      "Bash(rm -rf Learnable_R/__pycache__/*stablepca*)"
+      "Bash(rm -rf Learnable_R/__pycache__/*stablepca*)",
+      "Bash(chmod +x Learnable_R/run_mm_alignfirst_sweep.sh)"
     ]
   }
 }
