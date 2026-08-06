@@ -38,6 +38,7 @@ env/
 weights/
 checkpoints/
 results/
+Compact/Result/
 logs/
 
 # =========================
@@ -57,4 +58,6 @@ logs/
 # OS 파일
 # =========================
 .DS_Store
-Thumbs.dbNeurIPS24-ACON/
+Thumbs.db
+NeurIPS24-ACON/
+

@@ -1,0 +1,13 @@
+{
+  "method": "raw",
+  "R": null,
+  "imu_norm": "zscore",
+  "emg_antialias": true,
+  "emg_aa_cutoff": 450.0,
+  "emg_bandpass": [
+    20.0,
+    450.0
+  ],
+  "emg_fs": 1000,
+  "imu_fs": 100
+}
