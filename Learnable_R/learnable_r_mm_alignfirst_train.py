@@ -34,7 +34,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.metrics import accuracy_score
 from tqdm import tqdm
 
@@ -47,11 +46,51 @@ from mm_utils import set_seed, save_confusion_matrix, summarize_results  # noqa:
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from learnable_r_mm_model import LearnableRMMCDAN            # noqa: E402
 from learnable_r_model import gravity_loss, pca_alignment_loss  # noqa: E402
+from learnable_r_test_eval import (  # noqa: E402
+    SELECTION, REPORTED_METRIC, evaluate_test, summarize_metrics)
+from learnable_r_schedule import (  # noqa: E402
+    MODES as LR_MODES, apply_lr, lr_factor, schedule_note)
 
 WEIGHT_DIR = os.path.join(PROJECT_ROOT, "weights")
 RESULT_DIR = os.path.join(PROJECT_ROOT, "results", "Learnable_R")
 R_DIR = os.path.join(PROJECT_ROOT, "results", "R_matrices")
 NAME = "learnable_r_mm_alignfirst"
+
+# 백본 변형 — orig(Multimodal/mm_model) | compact(Compact/compact_model).
+# compact 산출물(결과 json·체크포인트·학습된 R)은 원본과 섞이지 않게 Compact/Result/ 로 보낸다.
+BACKBONE = "orig"
+MODEL_KW = {}
+
+
+def select_backbone(name, cdan_rp=False):
+    """백본 변형을 고르고 결과/체크포인트/R 저장 위치를 그에 맞게 바꾼다.
+
+    orig     : Multimodal/mm_model (기준)
+    compact  : Compact/compact_model  (TCN 블록 축소)          -> Compact/Result/
+    nointerp : Compact/nointerp_model (IMU 보간 제거, 파라미터 동일) -> Compact/Result/NoInterp/
+    """
+    global BACKBONE, MODEL_KW, RESULT_DIR, WEIGHT_DIR, R_DIR
+    if name == "orig":
+        if cdan_rp:
+            raise SystemExit("--cdan_rp 는 --backbone compact 에서만 쓸 수 있다.")
+        return
+    if name == "nointerp":
+        if cdan_rp:
+            raise SystemExit("--cdan_rp 는 --backbone compact 에서만 쓸 수 있다.")
+        BACKBONE = "nointerp"
+        MODEL_KW = {"backbone": "nointerp"}
+        base = os.path.join(PROJECT_ROOT, "Compact", "Result", "NoInterp")
+        RESULT_DIR = os.path.join(base, "Learnable_R")
+        WEIGHT_DIR = os.path.join(base, "weights")
+        R_DIR = os.path.join(base, "R_matrices")
+        return
+    if name != "compact":
+        raise ValueError(f"알 수 없는 backbone: {name!r} (orig|compact|nointerp 중 하나)")
+    BACKBONE = "compact"
+    MODEL_KW = {"backbone": "compact", "cdan_rp": cdan_rp}
+    RESULT_DIR = os.path.join(PROJECT_ROOT, "Compact", "Result", "Learnable_R")
+    WEIGHT_DIR = os.path.join(PROJECT_ROOT, "Compact", "Result", "weights")
+    R_DIR = os.path.join(PROJECT_ROOT, "Compact", "Result", "R_matrices")
 
 
 def pick_device():
@@ -164,7 +203,8 @@ def run_epoch(model, optimizer, train_loader, tgt_train_loader, criterion, crite
 
 def train(seed=42, epochs=30, batch_size=64, lr=1e-3, r_lr=1e-2,
           lambda_da=1.0, lambda_g=1.0, lambda_pca=1.0, post_r_norm="batchnorm",
-          target_join_epoch=10, freeze_r_epoch=None, report_last=10, save_cm=False, tag=""):
+          target_join_epoch=10, freeze_r_epoch=None, report_last=10, save_cm=False, tag="",
+          lr_schedule="global"):
     set_seed(seed)
     device = pick_device()
 
@@ -178,7 +218,8 @@ def train(seed=42, epochs=30, batch_size=64, lr=1e-3, r_lr=1e-2,
         get_mm_dataloaders(batch_size=batch_size)
     class_names = le.classes_
 
-    model = LearnableRMMCDAN(num_classes=num_classes, post_r_norm=post_r_norm).to(device)
+    model = LearnableRMMCDAN(num_classes=num_classes, post_r_norm=post_r_norm,
+                             **MODEL_KW).to(device)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     criterion_domain = nn.CrossEntropyLoss()
 
@@ -228,8 +269,15 @@ def train(seed=42, epochs=30, batch_size=64, lr=1e-3, r_lr=1e-2,
         {"params": other_params, "lr": lr, "weight_decay": 1e-3},
         {"params": r_params, "lr": r_lr, "weight_decay": 0.0},
     ])
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+    # LR 스케줄: base LR 을 붙잡아 두고 epoch 시작 시점에 직접 곱한다.
+    # "global" 은 기존 CosineAnnealingLR(T_max=epochs) 와 수치적으로 동일하고,
+    # "phase" 는 align/적응 두 구간에 독립 cosine 을 씌워 join 과 LR 위상을 분리한다
+    # (learnable_r_schedule 모듈 docstring 참고).
+    base_lrs = [g["lr"] for g in optimizer.param_groups]
+    print(f"LR 스케줄: {schedule_note(epochs, lr_schedule, target_join_epoch)}")
     for epoch in range(epochs):
+        cur_lrs = apply_lr(optimizer, base_lrs,
+                           lr_factor(epoch, epochs, lr_schedule, target_join_epoch))
         if freeze_r_epoch is not None and epoch == freeze_r_epoch:
             for p in model.r.parameters():
                 p.requires_grad_(False)
@@ -248,12 +296,12 @@ def train(seed=42, epochs=30, batch_size=64, lr=1e-3, r_lr=1e-2,
                       criterion_domain, device, alpha, lambda_da, lambda_g, lambda_pca,
                       target_align_only=target_align_only,
                       desc=f"Seed {seed} | Epoch [{epoch+1:02d}/{epochs:02d}]")
-        scheduler.step()
         phase = "align" if target_align_only else "joint"
         eval_and_log(epoch + 1, epochs,
                      extra=f"[{phase}] CE: {s['ce']:.3f} | Dom: {s['dom']:.3f} "
                            f"(Dacc {s['dom_acc']:.0f}%, α={alpha:.2f}) | "
-                           f"Grav: {s['grav']:.3f} | Pca: {s['pca']:.3f}")
+                           f"Grav: {s['grav']:.3f} | Pca: {s['pca']:.3f} | "
+                           f"lr {cur_lrs[0]:.2e}/{cur_lrs[1]:.2e}")
 
     # leakage-free 참고값: 마지막 N epoch target 정확도 평균/표준편차
     last = tgt_hist[-report_last:] if len(tgt_hist) >= report_last else tgt_hist
@@ -270,39 +318,57 @@ def train(seed=42, epochs=30, batch_size=64, lr=1e-3, r_lr=1e-2,
     np.save(r_path, R_best)
     print(f"학습된 R 저장: {r_path}\n{np.array2string(R_best, precision=4)}")
 
+    # ---- 최종 test 평가 (학습 종료 후 1회) -------------------------------
+    # 여기서 처음으로 test 를 로드한다. 위 학습 루프는 test 로더 자체를 갖고 있지
+    # 않으므로 model selection 에 test 가 개입할 여지가 없다.
+    test_metrics, test_cm = evaluate_test(model, evaluate_r, le, device,
+                                          seed=seed, batch_size=batch_size)
+
     if save_cm:
-        _, v_preds, v_true = evaluate_r(model, val_loader, device, apply_r=False)
-        _, t_preds, t_true = evaluate_r(model, tgt_val_loader, device, apply_r=True)
+        # 혼동 행렬도 보고 수치와 같은 test 기준으로 그린다.
+        v_true, v_preds = test_cm["source"]
+        t_true, t_preds = test_cm["target"]
+        src_te, tgt_te = test_metrics["source_test_acc"], test_metrics["target_test_acc"]
         save_confusion_matrix(
             v_true, v_preds, class_names,
-            os.path.join(RESULT_DIR, f"{NAME}{suffix}_seed{seed}_source_cm.png"),
-            f"MM Align-first Source (seed={seed}, Val: {best_val_acc:.1f}%)", cmap="Blues")
+            os.path.join(RESULT_DIR, f"{NAME}{suffix}_seed{seed}_source_test_cm.png"),
+            f"MM Align-first Source TEST (seed={seed}, Acc: {src_te:.1f}%)", cmap="Blues")
         save_confusion_matrix(
             t_true, t_preds, class_names,
-            os.path.join(RESULT_DIR, f"{NAME}{suffix}_seed{seed}_target_cm.png"),
-            f"MM Align-first Target (seed={seed}, Src: {best_val_acc:.1f}% vs Tgt: {best_target_acc:.1f}%)",
+            os.path.join(RESULT_DIR, f"{NAME}{suffix}_seed{seed}_target_test_cm.png"),
+            f"MM Align-first Target TEST (seed={seed}, Src: {src_te:.1f}% vs Tgt: {tgt_te:.1f}%)",
             cmap="Blues")
-        print("혼동 행렬 시각화 저장 완료.")
+        print("혼동 행렬 시각화 저장 완료 (test 기준).")
 
-    return {"seed": seed, "source_acc": best_val_acc, "target_acc": best_target_acc,
+    return {"seed": seed, "lr_schedule": lr_schedule,
+            "source_acc": best_val_acc, "target_acc": best_target_acc,
             "shift": best_val_acc - best_target_acc,
-            "target_last_mean": last_mean, "target_last_std": last_std}
+            "target_last_mean": last_mean, "target_last_std": last_std,
+            **test_metrics}
 
 
 def write_result_json(results, tag):
-    src = [r["source_acc"] for r in results]
-    tgt = [r["target_acc"] for r in results]
-    sh = [r["shift"] for r in results]
+    mean, std = summarize_metrics(results)
+    # target_last_mean(마지막 N epoch 평균 = oracle selection 안 쓴 참고값)은 이 스크립트
+    # 고유 지표라 공통 집계에 없다. 따로 붙인다.
     last = [r["target_last_mean"] for r in results]
     ddof = 1 if len(results) > 1 else 0
+    mean["target_last_mean"] = float(np.mean(last))
+    std["target_last_mean"] = float(np.std(last, ddof=ddof))
     payload = {
         "tag": tag or "default", "modality": "emg_imu_multimodal", "model": NAME,
+        "backbone": BACKBONE,
+        "cdan_rp": bool(MODEL_KW.get("cdan_rp", False)),
+        **({"compact": __import__("Compact.compact_model", fromlist=["x"]).variant_info()}
+           if BACKBONE == "compact" else {}),
+        **({"nointerp": __import__("Compact.nointerp_model", fromlist=["x"]).variant_info()}
+           if BACKBONE == "nointerp" else {}),
         "data_dir": os.environ.get("MM_DATA_DIR", "preprocessed_MM_raw"),
+        "lr_schedule": results[0].get("lr_schedule", "global"),
+        "selection": SELECTION,             # model selection 기준 — 보고 시 명시할 것
+        "reported_metric": REPORTED_METRIC,
         "seeds": [r["seed"] for r in results], "results": results,
-        "mean": {"source_acc": float(np.mean(src)), "target_acc": float(np.mean(tgt)),
-                 "shift": float(np.mean(sh)), "target_last_mean": float(np.mean(last))},
-        "std": {"source_acc": float(np.std(src, ddof=ddof)), "target_acc": float(np.std(tgt, ddof=ddof)),
-                "shift": float(np.std(sh, ddof=ddof)), "target_last_mean": float(np.std(last, ddof=ddof))},
+        "mean": mean, "std": std,
     }
     os.makedirs(RESULT_DIR, exist_ok=True)
     path = os.path.join(RESULT_DIR, f"{NAME}_result_{tag or 'default'}.json")
@@ -317,6 +383,13 @@ def write_result_json(results, tag):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backbone", choices=["orig", "compact", "nointerp"], default="orig",
+                        help="백본 변형. compact=TCN 블록 축소(Compact/Result/), "
+                             "nointerp=IMU 인코더가 길이 500 을 직접 내어 F.interpolate 제거 "
+                             "(파라미터는 orig 과 동일, Compact/Result/NoInterp/).")
+    parser.add_argument("--cdan_rp", action="store_true",
+                        help="CDAN 조건부 판별기 입력을 외적(5120) 대신 랜덤 multilinear map(1024)으로. "
+                             "--backbone compact 에서만 지원.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--multi_seed", action="store_true")
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
@@ -334,6 +407,10 @@ def parse_args():
                         choices=["none", "instance", "batchnorm"])
     parser.add_argument("--freeze_r_epoch", type=int, default=None,
                         help="이 epoch 까지 R 학습 후 고정. 미지정=끝까지 R 학습")
+    parser.add_argument("--lr_schedule", choices=list(LR_MODES), default="global",
+                        help="global(기본, 기존 동작): 단일 cosine T_max=epochs. "
+                             "phase: align 구간과 적응 구간에 독립 cosine → 어떤 join 이든 "
+                             "적응이 base LR 에서 시작(join 과 LR 위상의 교락 제거).")
     parser.add_argument("--report_last", type=int, default=10,
                         help="leakage-free 참고값용 마지막 N epoch target 정확도 평균 (기본 10)")
     parser.add_argument("--no_cm", action="store_true")
@@ -343,11 +420,13 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    select_backbone(args.backbone, args.cdan_rp)
     suffix = f"_{args.tag}" if args.tag else ""
     kw = dict(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, r_lr=args.r_lr,
               lambda_da=args.lambda_da, lambda_g=args.lambda_g, lambda_pca=args.lambda_pca,
               post_r_norm=args.post_r_norm, target_join_epoch=args.target_join_epoch,
               freeze_r_epoch=args.freeze_r_epoch, report_last=args.report_last,
+              lr_schedule=args.lr_schedule,
               save_cm=not args.no_cm, tag=args.tag)
 
     if args.multi_seed:

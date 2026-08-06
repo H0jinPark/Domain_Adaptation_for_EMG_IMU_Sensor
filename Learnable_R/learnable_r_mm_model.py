@@ -44,28 +44,64 @@ class LearnableRMMCDAN(nn.Module):
     """
 
     def __init__(self, num_classes=10, feature_dim=512, R_init=None, post_r_norm="none",
-                 r_param="so3"):
+                 r_param="so3", backbone="orig", cdan_rp=False):
         super().__init__()
         self.num_classes = num_classes
         self.feature_dim = feature_dim
         self.post_r_norm = post_r_norm   # "none" | "instance" | "batchnorm" (IMU 에만 적용)
         self.r_param = r_param            # "so3"(기본) | "quat" | "matrix"
+        self.backbone_variant = backbone  # "orig" | "compact"
+        self.cdan_rp = cdan_rp
 
         self.r = build_learnable_r(r_param, R_init)
         if post_r_norm == "batchnorm":
             self.input_bn = nn.BatchNorm1d(3)  # R 직후 IMU 축별 정규화 (회전→정규화)
-        self.backbone = InterFusionBackbone()
-        self.label_classifier = _build_label_classifier(num_classes)
 
-        cdan_input_dim = feature_dim * num_classes
-        self.domain_classifier = nn.Sequential(
-            nn.Linear(cdan_input_dim, 1024), nn.GELU(), nn.Dropout(0.5),
-            nn.Linear(1024, 512), nn.GELU(), nn.Dropout(0.5),
-            nn.Linear(512, 2),
-        )
+        # 백본/헤드/판별기는 백본 변형에 따라 갈아끼운다. compact 는 TCN 블록을 줄인
+        # 버전이며 출력 차원(512)이 같아 나머지 로직은 그대로다.
+        if backbone == "compact":
+            from Compact.compact_model import (
+                InterFusionBackbone as CompactBackbone,
+                _build_label_classifier as compact_label_head,
+                _build_cdan_domain_classifier as compact_disc)
+            self.backbone = CompactBackbone()
+            self.label_classifier = compact_label_head(num_classes)
+            self.rp, self.domain_classifier = compact_disc(
+                feature_dim, num_classes, cdan_rp)
+        elif backbone == "nointerp":
+            # IMU 인코더가 길이 500 을 그대로 내므로 fusion 앞의 F.interpolate 가 없다.
+            # 헤드/판별기는 원본과 동일 → 차이는 오직 IMU 시간해상도.
+            if cdan_rp:
+                raise ValueError("cdan_rp 는 backbone='compact' 에서만 지원한다")
+            from Compact.nointerp_model import InterFusionBackbone as NoInterpBackbone
+            self.rp = None
+            self.backbone = NoInterpBackbone()
+            self.label_classifier = _build_label_classifier(num_classes)
+            cdan_input_dim = feature_dim * num_classes
+            self.domain_classifier = nn.Sequential(
+                nn.Linear(cdan_input_dim, 1024), nn.GELU(), nn.Dropout(0.5),
+                nn.Linear(1024, 512), nn.GELU(), nn.Dropout(0.5),
+                nn.Linear(512, 2),
+            )
+        elif backbone == "orig":
+            if cdan_rp:
+                raise ValueError("cdan_rp 는 backbone='compact' 에서만 지원한다")
+            self.rp = None
+            self.backbone = InterFusionBackbone()
+            self.label_classifier = _build_label_classifier(num_classes)
+            cdan_input_dim = feature_dim * num_classes
+            self.domain_classifier = nn.Sequential(
+                nn.Linear(cdan_input_dim, 1024), nn.GELU(), nn.Dropout(0.5),
+                nn.Linear(1024, 512), nn.GELU(), nn.Dropout(0.5),
+                nn.Linear(512, 2),
+            )
+        else:
+            raise ValueError(f"알 수 없는 backbone: {backbone!r} (orig|compact|nointerp)")
 
     def conditional_feature(self, features, class_logits):
         class_probs = F.softmax(class_logits, dim=1)
+        if self.rp is not None:
+            return self.rp(features, class_probs)
         conditional = torch.bmm(class_probs.unsqueeze(2), features.unsqueeze(1))
         return conditional.view(features.size(0), -1)
 

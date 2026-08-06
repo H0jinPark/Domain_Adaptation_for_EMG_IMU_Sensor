@@ -1,31 +1,27 @@
-"""Align-first 2단계 학습 (원본 base 방법론에 target-join 지연만 추가, cpca 무관).
+"""Align-first(2단계) × 쿼터니언 R × both(중력+PCA) prior 결합 학습.
 
-아이디어(유저, 2026-07-03): 초반 R 이 크게 움직이는 서칭 구간에서 target 특징이 마구
-흔들려 **인코더가 잘못된 축에 헷갈리며 나쁘게 적응**한다(source 는 안정, target 만 요동).
-그래서 초반에는 source 와 target 을 **다르게** 흘린다:
+2026-07-10 loss ablation 에서 both(λ_g=1,λ_pca=1) align-first 세팅이 Target 80.5% 로
+가장 안정적으로 나왔다([[result-mm-alignfirst-null]] 흐름의 IMU 단독 갈래). 그 "잘 나온"
+세팅을 그대로 두고 **R 의 표현만 SO(3)(so3_exp) → 단위 쿼터니언(4-파라미터)** 으로 바꾼
+변형이다. 목적은 [[pipeline-learnable-r]] 의 재현성 문제(비-42 seed 에서 R 이 인코더보다
+느리게 수렴해 나쁜 국소해에 갇힘)를 쿼터니언 landscape(항등 부근 exp-map 특이점 없음)로
+완화할 수 있는지 align-first 조건에서 확인하는 것.
 
-  · 1단계 (epoch < --target_join_epoch, 기본 10):
-      - source : 원래대로 인코더 → CE (인코더/BN 통계는 순수 source 로만 형성).
-      - target : **인코더/판별기를 아예 거치지 않는다.** gravity/pca 손실 계산에만 쓰여
-                 **R 만 정렬**된다(raw target IMU + R 의 3x3 회전, 인코더 무관).
-      - domain 적대는 target 이 판별기에 안 오므로 자연히 off(α=0).
-  · 2단계 (epoch ≥ target_join_epoch):
-      - R 이 어느 정도 정렬된 뒤, **target 도 인코더+판별기에 합류**. 여기서부터 CDAN
-        도메인 적대로 인코더를 target 에 적응시킨다. α 는 합류 시점부터 0→1 ramp(급 GRL
-        충격 방지).
+learnable_r_cdan_alignfirst_train.py(so3 원본)를 복제하되 두 가지만 바꿨다:
+  1. 모델 생성 시 r_param="quat" (LearnableRQuat, det=+1·RᵀR=I 구조적 보장).
+  2. R 파라미터 접근을 so(3) w → 쿼터니언 q 로 교체(freeze 체크·gradient 진단 두 곳).
+손실·데이터·align-first 타이밍(target_join_epoch)·CDAN 규약은 원본과 완전히 동일하다.
+쿼터니언은 정규화로 회전임이 보장되므로 rotation reg 는 여전히 불필요(λ_rot=0).
 
-dadelay(폐기)와의 차이: dadelay 는 target 을 여전히 인코더에 통과시키되 domain 손실만
-껐다(BN 통계가 흔들리는 target 에 오염될 수 있음). 여기선 **1단계에 target 이 인코더를
-아예 안 거친다** → 인코더/BN 이 순수 source 로만 형성돼 "잘못된 축 오염"을 직접 차단.
-가설(인코더가 흔들리는 target 에 헷갈림)에 더 정확히 대응한다.
+align-first 2단계(원본과 동일):
+  · 1단계 (epoch < --target_join_epoch, 기본 10): source 만 인코더→CE, target 은 인코더
+    미경유·gravity/pca 로 R(쿼터니언)만 정렬, domain off(α=0).
+  · 2단계 (epoch ≥ target_join_epoch): target 도 인코더/판별기 합류, CDAN 적대(α 0→1 ramp).
 
-이 실험은 **원본 base 레시피(SO(3)+gravity+aggregate pca+CDAN JOINT)에 2단계 타이밍만**
-얹은 것으로, class-conditional PCA(cpca)와 완전 별개다. learnable_r_cdan_train.py 를 그대로
-복제해 run_epoch/train 에 target-join 분기만 추가했다(공통 common.py·cpca 미사용).
-
-실행 예:
-    MM_DATA_DIR=preprocessed_MM_raw_isotropic python Learnable_R/learnable_r_cdan_alignfirst_train.py \
-        --multi_seed --epochs 60 --target_join_epoch 10 --tag alignfirst10
+실행 예(both = 기본 λ_g=1 λ_pca=1):
+    MM_DATA_DIR=preprocessed_MM_raw_isotropic python \
+        Learnable_R/learnable_r_cdan_alignfirst_quat_train.py \
+        --multi_seed --epochs 60 --target_join_epoch 10 --no_cm --tag both_quat
 """
 import os
 import sys
@@ -36,6 +32,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.metrics import accuracy_score
 from tqdm import tqdm
 
@@ -50,13 +47,12 @@ from learnable_r_model import (  # noqa: E402
     LearnableRCDAN, gravity_loss, pca_alignment_loss)
 from learnable_r_test_eval import (  # noqa: E402
     SELECTION, REPORTED_METRIC, evaluate_test, summarize_metrics)
-from learnable_r_schedule import (  # noqa: E402
-    MODES as LR_MODES, apply_lr, lr_factor, schedule_note)
 
 WEIGHT_DIR = os.path.join(PROJECT_ROOT, "weights")
 RESULT_DIR = os.path.join(PROJECT_ROOT, "results", "Learnable_R")
 R_DIR = os.path.join(PROJECT_ROOT, "results", "R_matrices")
-NAME = "learnable_r_cdan_alignfirst"
+NAME = "learnable_r_cdan_alignfirst_quat"
+R_PARAM = "quat"   # 이 스크립트 전용 R 파라미터화 (원본 so3 대비 유일한 모델 차이)
 
 
 def pick_device():
@@ -91,7 +87,8 @@ def run_epoch(model, optimizer, train_loader, tgt_train_loader, criterion, crite
     두 단계 모두 gravity/pca 는 raw IMU + R 로 계산되어 인코더를 거치지 않는다.
     """
     model.train()
-    r_frozen = not model.r.w.requires_grad
+    # 쿼터니언 파라미터는 q (so3 원본의 w 자리). freeze 체크·gradient 진단 모두 q 로 본다.
+    r_frozen = not model.r.q.requires_grad
     len_loader = min(len(train_loader), len(tgt_train_loader))
     tot = {"ce": 0.0, "dom": 0.0, "grav": 0.0, "pca": 0.0, "dom_acc": 0.0}
     grad_diag = None
@@ -125,8 +122,8 @@ def run_epoch(model, optimizer, train_loader, tgt_train_loader, criterion, crite
         L_grav = gravity_loss(model.r.R, src_imu, tgt_imu) if (lam_g > 0 and not r_frozen) else zero
         L_pca = pca_alignment_loss(model.r.R, src_imu, tgt_imu) if (lam_pca > 0 and not r_frozen) else zero
 
-        # ---- (진단) R 파라미터(so(3) w)에 대한 손실 항별 gradient 분해 ----
-        Rparam = model.r.w
+        # ---- (진단) R 파라미터(쿼터니언 q)에 대한 손실 항별 gradient 분해 ----
+        Rparam = model.r.q
         if i == 0 and log_r_grads and Rparam.requires_grad:
             def _gR(term):
                 if not term.requires_grad:
@@ -168,8 +165,7 @@ def run_epoch(model, optimizer, train_loader, tgt_train_loader, criterion, crite
     return out
 
 
-def train(seed=42, epochs=30, batch_size=64, lr=1e-3, r_lr=1e-2, lr_schedule="global",
-          report_last=10,
+def train(seed=42, epochs=30, batch_size=64, lr=1e-3, r_lr=1e-2,
           lambda_da=1.0, lambda_g=1.0, lambda_pca=1.0, post_r_norm="batchnorm",
           target_join_epoch=10, freeze_r_epoch=None, save_cm=False, tag=""):
     set_seed(seed)
@@ -185,13 +181,14 @@ def train(seed=42, epochs=30, batch_size=64, lr=1e-3, r_lr=1e-2, lr_schedule="gl
         get_mm_dataloaders(batch_size=batch_size)
     class_names = le.classes_
 
-    model = LearnableRCDAN(num_classes=num_classes, post_r_norm=post_r_norm).to(device)
+    model = LearnableRCDAN(num_classes=num_classes, post_r_norm=post_r_norm,
+                           r_param=R_PARAM).to(device)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     criterion_domain = nn.CrossEntropyLoss()
 
     print("\n" + "=" * 60)
-    print(f"Learnable-R CDAN align-first (2-phase) Training Start  |  seed={seed}")
-    print("Mode: JOINT | target IMU -> R(SO(3)) -> encoder, align by CDAN adversarial")
+    print(f"Learnable-R CDAN align-first (2-phase) | R=quaternion  |  seed={seed}")
+    print("Mode: JOINT | target IMU -> R(quat) -> encoder, align by CDAN adversarial")
     print(f"lambda: da={lambda_da} gravity={lambda_g} pca={lambda_pca} | post_r_norm={post_r_norm}")
     print(f"align-first: 1단계 epoch 0-{target_join_epoch-1} target 은 gravity/pca 로 R 만 정렬"
           f"(인코더 미경유) → 2단계 epoch {target_join_epoch}~ target 인코더/판별기 합류(α ramp)")
@@ -200,7 +197,6 @@ def train(seed=42, epochs=30, batch_size=64, lr=1e-3, r_lr=1e-2, lr_schedule="gl
     print("=" * 60)
 
     best_val_acc, best_target_acc = 0.0, 0.0
-    tgt_hist = []  # 에폭별 target 정확도(leakage-free last-N 집계용, MM 판과 동일)
     eye3 = torch.eye(3, device=device)
 
     def geo_angle(A, B):
@@ -211,7 +207,6 @@ def train(seed=42, epochs=30, batch_size=64, lr=1e-3, r_lr=1e-2, lr_schedule="gl
         nonlocal best_val_acc, best_target_acc
         val_acc, _, _ = evaluate_r(model, val_loader, device, apply_r=False)
         tgt_acc, _, _ = evaluate_r(model, tgt_val_loader, device, apply_r=True)
-        tgt_hist.append(tgt_acc)
         is_best = tgt_acc > best_target_acc
         if is_best:
             best_val_acc, best_target_acc = val_acc, tgt_acc
@@ -236,13 +231,8 @@ def train(seed=42, epochs=30, batch_size=64, lr=1e-3, r_lr=1e-2, lr_schedule="gl
         {"params": other_params, "lr": lr, "weight_decay": 1e-3},
         {"params": r_params, "lr": r_lr, "weight_decay": 0.0},
     ])
-    # LR 스케줄 — "global" 은 기존 CosineAnnealingLR(T_max=epochs) 와 수치 동일,
-    # "phase" 는 align/적응 구간에 독립 cosine (learnable_r_schedule 참고).
-    base_lrs = [g["lr"] for g in optimizer.param_groups]
-    print(f"LR 스케줄: {schedule_note(epochs, lr_schedule, target_join_epoch)}")
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
     for epoch in range(epochs):
-        cur_lrs = apply_lr(optimizer, base_lrs,
-                           lr_factor(epoch, epochs, lr_schedule, target_join_epoch))
         if freeze_r_epoch is not None and epoch == freeze_r_epoch:
             for p in model.r.parameters():
                 p.requires_grad_(False)
@@ -263,26 +253,19 @@ def train(seed=42, epochs=30, batch_size=64, lr=1e-3, r_lr=1e-2, lr_schedule="gl
                       criterion_domain, device, alpha, lambda_da, lambda_g, lambda_pca,
                       target_align_only=target_align_only,
                       desc=f"Seed {seed} | Epoch [{epoch+1:02d}/{epochs:02d}]")
+        scheduler.step()
         phase = "align" if target_align_only else "joint"
         eval_and_log(epoch + 1, epochs,
                      extra=f"[{phase}] CE: {s['ce']:.3f} | Dom: {s['dom']:.3f} "
                            f"(Dacc {s['dom_acc']:.0f}%, α={alpha:.2f}) | "
-                           f"Grav: {s['grav']:.3f} | Pca: {s['pca']:.3f} | "
-                           f"lr {cur_lrs[0]:.2e}/{cur_lrs[1]:.2e}")
-
-    # leakage-free 참고값: 마지막 N epoch target 정확도 평균/표준편차
-    last = tgt_hist[-report_last:] if len(tgt_hist) >= report_last else tgt_hist
-    last_mean, last_std = float(np.mean(last)), float(np.std(last))
+                           f"Grav: {s['grav']:.3f} | Pca: {s['pca']:.3f}")
 
     print(f"\n최종 결과 | seed={seed} | Best Source Val: {best_val_acc:.2f}% | "
-          f"Target at Best(oracle peak): {best_target_acc:.2f}% | "
-          f"Shift: {best_val_acc - best_target_acc:.2f}%")
-    print(f"           leakage-free last-{len(last)} Target: {last_mean:.2f} ± {last_std:.2f}% "
-          f"(target 라벨로 epoch 안 고른 참고값)")
+          f"Target at Best: {best_target_acc:.2f}% | Shift: {best_val_acc - best_target_acc:.2f}%")
 
     model.load_state_dict(torch.load(save_path, map_location=device))
     R_best = model.r.R.detach().cpu().numpy()
-    r_path = os.path.join(R_DIR, f"R_learned_alignfirst{suffix}_seed{seed}.npy")
+    r_path = os.path.join(R_DIR, f"R_learned_alignfirst_quat{suffix}_seed{seed}.npy")
     np.save(r_path, R_best)
     print(f"학습된 R 저장: {r_path}\n{np.array2string(R_best, precision=4)}")
 
@@ -300,34 +283,23 @@ def train(seed=42, epochs=30, batch_size=64, lr=1e-3, r_lr=1e-2, lr_schedule="gl
         save_confusion_matrix(
             v_true, v_preds, class_names,
             os.path.join(RESULT_DIR, f"{NAME}{suffix}_seed{seed}_source_test_cm.png"),
-            f"Align-first Source TEST (seed={seed}, Acc: {src_te:.1f}%)", cmap="Blues")
+            f"Align-first quat Source TEST (seed={seed}, Acc: {src_te:.1f}%)", cmap="Blues")
         save_confusion_matrix(
             t_true, t_preds, class_names,
             os.path.join(RESULT_DIR, f"{NAME}{suffix}_seed{seed}_target_test_cm.png"),
-            f"Align-first Target TEST (seed={seed}, Src: {src_te:.1f}% vs Tgt: {tgt_te:.1f}%)",
+            f"Align-first quat Target TEST (seed={seed}, Src: {src_te:.1f}% vs Tgt: {tgt_te:.1f}%)",
             cmap="Blues")
         print("혼동 행렬 시각화 저장 완료 (test 기준).")
 
-    return {"seed": seed, "lr_schedule": lr_schedule,
-            "source_acc": best_val_acc, "target_acc": best_target_acc,
-            "shift": best_val_acc - best_target_acc,
-            "target_last_mean": last_mean, "target_last_std": last_std,
-            **test_metrics}
+    return {"seed": seed, "source_acc": best_val_acc, "target_acc": best_target_acc,
+            "shift": best_val_acc - best_target_acc, **test_metrics}
 
 
 def write_result_json(results, tag):
     mean, std = summarize_metrics(results)
-    # target_last_mean(마지막 N epoch 평균 = oracle selection 안 쓴 참고값)은 공통 집계에
-    # 없는 이 계열 고유 지표라 따로 붙인다. MM 판과 키 이름을 맞춰 뒀다.
-    if all("target_last_mean" in r for r in results):
-        last = [r["target_last_mean"] for r in results]
-        ddof = 1 if len(results) > 1 else 0
-        mean["target_last_mean"] = float(np.mean(last))
-        std["target_last_mean"] = float(np.std(last, ddof=ddof))
     payload = {
         "tag": tag or "default", "modality": "imu_only", "model": NAME,
         "data_dir": os.environ.get("MM_DATA_DIR", "preprocessed_MM_raw"),
-        "lr_schedule": results[0].get("lr_schedule", "global"),
         "selection": SELECTION,             # model selection 기준 — 보고 시 명시할 것
         "reported_metric": REPORTED_METRIC,
         "seeds": [r["seed"] for r in results], "results": results,
@@ -351,8 +323,8 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--r_lr", type=float, default=1e-2, help="learnable R 전용 학습률")
     parser.add_argument("--lambda_da", type=float, default=1.0, help="domain(CDAN) 손실 가중치")
-    parser.add_argument("--lambda_g", type=float, default=1.0, help="L_gravity 가중치(isotropic 에서 의미)")
-    parser.add_argument("--lambda_pca", type=float, default=1.0, help="on-the-fly PCA 정렬 prior 가중치")
+    parser.add_argument("--lambda_g", type=float, default=1.0, help="L_gravity 가중치(both=1)")
+    parser.add_argument("--lambda_pca", type=float, default=1.0, help="on-the-fly PCA 정렬 prior 가중치(both=1)")
     parser.add_argument("--target_join_epoch", type=int, default=10,
                         help="이 epoch 부터 target 이 인코더/판별기에 합류. 그 전엔 target 은 "
                              "gravity/pca 로 R 만 정렬(인코더 미경유). 0=끔(처음부터 합류=원본 base)")
@@ -360,12 +332,6 @@ def parse_args():
                         choices=["none", "instance", "batchnorm"])
     parser.add_argument("--freeze_r_epoch", type=int, default=None,
                         help="이 epoch 까지 R 학습 후 고정. 미지정=끝까지 R 학습")
-    parser.add_argument("--lr_schedule", choices=list(LR_MODES), default="global",
-                        help="global(기본, 기존 동작): 단일 cosine T_max=epochs. "
-                             "phase: align 구간과 적응 구간에 독립 cosine → 어떤 join 이든 "
-                             "적응이 base LR 에서 시작(join 과 LR 위상의 교락 제거).")
-    parser.add_argument("--report_last", type=int, default=10,
-                        help="마지막 N epoch target 정확도 평균을 leakage-free 참고값으로 기록")
     parser.add_argument("--no_cm", action="store_true")
     parser.add_argument("--tag", type=str, default="")
     return parser.parse_args()
@@ -377,14 +343,13 @@ if __name__ == "__main__":
     kw = dict(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, r_lr=args.r_lr,
               lambda_da=args.lambda_da, lambda_g=args.lambda_g, lambda_pca=args.lambda_pca,
               post_r_norm=args.post_r_norm, target_join_epoch=args.target_join_epoch,
-              freeze_r_epoch=args.freeze_r_epoch, save_cm=not args.no_cm, tag=args.tag,
-              lr_schedule=args.lr_schedule, report_last=args.report_last)
+              freeze_r_epoch=args.freeze_r_epoch, save_cm=not args.no_cm, tag=args.tag)
 
     if args.multi_seed:
         results = [train(seed=s, **kw) for s in args.seeds]
         os.makedirs(RESULT_DIR, exist_ok=True)
         summarize_results(results,
-                          method_name=f"Learnable-R CDAN align-first{' | '+args.tag if args.tag else ''}",
+                          method_name=f"Learnable-R CDAN align-first quat{' | '+args.tag if args.tag else ''}",
                           save_path=os.path.join(RESULT_DIR, f"{NAME}{suffix}_summary.txt"))
     else:
         results = [train(seed=args.seed, **kw)]

@@ -38,6 +38,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from learnable_r_model import (  # noqa: E402
     LearnableRCDAN, gravity_loss, pca_alignment_loss, rotation_reg_loss,
     class_pca_alignment_loss)
+from learnable_r_test_eval import (  # noqa: E402
+    SELECTION, REPORTED_METRIC, evaluate_test, summarize_metrics)
 
 WEIGHT_DIR = os.path.join(PROJECT_ROOT, "weights")
 RESULT_DIR = os.path.join(PROJECT_ROOT, "results", "Learnable_R")
@@ -286,37 +288,41 @@ def train(seed, name, r_param, epochs=30, batch_size=64, lr=1e-3, r_lr=1e-2,
     np.save(r_path, R_best)
     print(f"학습된 R 저장: {r_path}\n{np.array2string(R_best, precision=4)}")
 
+    # ---- 최종 test 평가 (학습 종료 후 1회) -------------------------------
+    # 여기서 처음으로 test 를 로드한다. 위 학습 루프는 test 로더 자체를 갖고 있지
+    # 않으므로 model selection 에 test 가 개입할 여지가 없다.
+    test_metrics, test_cm = evaluate_test(model, evaluate_r, le, device,
+                                          seed=seed, batch_size=batch_size)
+
     if save_cm:
-        _, v_preds, v_true = evaluate_r(model, val_loader, device, apply_r=False)
-        _, t_preds, t_true = evaluate_r(model, tgt_val_loader, device, apply_r=True)
+        # 혼동 행렬도 보고 수치와 같은 test 기준으로 그린다.
+        v_true, v_preds = test_cm["source"]
+        t_true, t_preds = test_cm["target"]
+        src_te, tgt_te = test_metrics["source_test_acc"], test_metrics["target_test_acc"]
         save_confusion_matrix(
             v_true, v_preds, class_names,
-            os.path.join(RESULT_DIR, f"{name}{suffix}_seed{seed}_source_cm.png"),
-            f"{name} Source (seed={seed}, Val: {best_val_acc:.1f}%)", cmap="Blues")
+            os.path.join(RESULT_DIR, f"{name}{suffix}_seed{seed}_source_test_cm.png"),
+            f"{name} Source TEST (seed={seed}, Acc: {src_te:.1f}%)", cmap="Blues")
         save_confusion_matrix(
             t_true, t_preds, class_names,
-            os.path.join(RESULT_DIR, f"{name}{suffix}_seed{seed}_target_cm.png"),
-            f"{name} Target (seed={seed}, Src: {best_val_acc:.1f}% vs Tgt: {best_target_acc:.1f}%)",
+            os.path.join(RESULT_DIR, f"{name}{suffix}_seed{seed}_target_test_cm.png"),
+            f"{name} Target TEST (seed={seed}, Src: {src_te:.1f}% vs Tgt: {tgt_te:.1f}%)",
             cmap="Blues")
-        print("혼동 행렬 시각화 저장 완료.")
+        print("혼동 행렬 시각화 저장 완료 (test 기준).")
 
     return {"seed": seed, "source_acc": best_val_acc, "target_acc": best_target_acc,
-            "shift": best_val_acc - best_target_acc}
+            "shift": best_val_acc - best_target_acc, **test_metrics}
 
 
 def write_result_json(results, name, tag):
-    src = [r["source_acc"] for r in results]
-    tgt = [r["target_acc"] for r in results]
-    sh = [r["shift"] for r in results]
-    ddof = 1 if len(results) > 1 else 0
+    mean, std = summarize_metrics(results)
     payload = {
         "tag": tag or "default", "modality": "imu_only", "model": name,
         "data_dir": os.environ.get("MM_DATA_DIR", "preprocessed_MM_raw"),
+        "selection": SELECTION,             # model selection 기준 — 보고 시 명시할 것
+        "reported_metric": REPORTED_METRIC,
         "seeds": [r["seed"] for r in results], "results": results,
-        "mean": {"source_acc": float(np.mean(src)), "target_acc": float(np.mean(tgt)),
-                 "shift": float(np.mean(sh))},
-        "std": {"source_acc": float(np.std(src, ddof=ddof)), "target_acc": float(np.std(tgt, ddof=ddof)),
-                "shift": float(np.std(sh, ddof=ddof))},
+        "mean": mean, "std": std,
     }
     os.makedirs(RESULT_DIR, exist_ok=True)
     path = os.path.join(RESULT_DIR, f"{name}_result_{tag or 'default'}.json")
