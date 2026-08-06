@@ -72,7 +72,12 @@ def save_confusion_matrix(labels, preds, class_names, path, title, cmap="Blues")
 # Multi-seed 결과 요약
 # ----------------------------------------------------------------------
 def summarize_results(results, method_name="", save_path=None):
-    """seed 별 source/target/shift 정확도를 표로 출력하고 평균±표준편차를 보고한다.
+    """seed 별 정확도를 표로 출력하고 평균±표준편차를 보고한다.
+
+    results 에 target_test_acc 키가 있으면 test 컬럼까지 함께 낸다(없으면 기존과
+    동일한 4컬럼). test 를 쓰지 않는 스크립트를 깨지 않으려고 옵션으로 뒀다.
+    **논문에 싣는 숫자는 Tgt-Test 컬럼이다** — Source/Target 은 val 이라 model
+    selection 에 쓰였으므로 낙관적으로 편향돼 있다.
 
     save_path 가 주어지면 동일한 요약을 텍스트 파일로도 저장한다.
     """
@@ -81,27 +86,51 @@ def summarize_results(results, method_name="", save_path=None):
     shift = np.array([r["shift"] for r in results])
     ddof = 1 if len(results) > 1 else 0
 
+    has_test = all("target_test_acc" in r for r in results)
+    if has_test:
+        src_te = np.array([r["source_test_acc"] for r in results])
+        tgt_te = np.array([r["target_test_acc"] for r in results])
+
+    width = 84 if has_test else 60
+    def row(label, a, b, c, d=None, e=None):
+        cells = " | ".join(f"{v:>8.2f}%" for v in (a, b, c))
+        if has_test:
+            cells += " | " + " | ".join(f"{v:>8.2f}%" for v in (d, e))
+        return f"{label:>6} | {cells}"
+
     lines = []
-    lines.append("=" * 60)
+    lines.append("=" * width)
     lines.append(f" Multi-seed Summary  |  {method_name}")
     lines.append(f" seeds = {[r['seed'] for r in results]}  (n={len(results)})")
-    lines.append("=" * 60)
-    lines.append(f"{'Seed':>6} | {'Source':>9} | {'Target':>9} | {'Shift':>9}")
-    lines.append("-" * 60)
+    if has_test:
+        lines.append(" val = model selection 용(낙관 편향) | test = 최종 보고용")
+    lines.append("=" * width)
+    hdr = f"{'Seed':>6} | {'Src-Val':>9} | {'Tgt-Val':>9} | {'Shift':>9}"
+    if has_test:
+        hdr += f" | {'Src-Test':>9} | {'Tgt-Test':>9}"
+    lines.append(hdr)
+    lines.append("-" * width)
     for r in results:
-        lines.append(f"{r['seed']:>6} | {r['source_acc']:>8.2f}% | "
-                     f"{r['target_acc']:>8.2f}% | {r['shift']:>8.2f}%")
-    lines.append("-" * 60)
-    lines.append(f"{'Mean':>6} | {source.mean():>8.2f}% | "
-                 f"{target.mean():>8.2f}% | {shift.mean():>8.2f}%")
-    lines.append(f"{'Std':>6} | {source.std(ddof=ddof):>8.2f}% | "
-                 f"{target.std(ddof=ddof):>8.2f}% | {shift.std(ddof=ddof):>8.2f}%")
-    lines.append("=" * 60)
-    lines.append(
-        f" Source : {source.mean():.2f} ± {source.std(ddof=ddof):.2f} %\n"
-        f" Target : {target.mean():.2f} ± {target.std(ddof=ddof):.2f} %\n"
-        f" Shift  : {shift.mean():.2f} ± {shift.std(ddof=ddof):.2f} %")
-    lines.append("=" * 60)
+        lines.append(row(r["seed"], r["source_acc"], r["target_acc"], r["shift"],
+                         r.get("source_test_acc"), r.get("target_test_acc")))
+    lines.append("-" * width)
+    lines.append(row("Mean", source.mean(), target.mean(), shift.mean(),
+                     src_te.mean() if has_test else None,
+                     tgt_te.mean() if has_test else None))
+    lines.append(row("Std", source.std(ddof=ddof), target.std(ddof=ddof), shift.std(ddof=ddof),
+                     src_te.std(ddof=ddof) if has_test else None,
+                     tgt_te.std(ddof=ddof) if has_test else None))
+    lines.append("=" * width)
+    summary = (
+        f" Src-Val  : {source.mean():.2f} ± {source.std(ddof=ddof):.2f} %\n"
+        f" Tgt-Val  : {target.mean():.2f} ± {target.std(ddof=ddof):.2f} %\n"
+        f" Shift    : {shift.mean():.2f} ± {shift.std(ddof=ddof):.2f} %")
+    if has_test:
+        summary += (
+            f"\n Src-Test : {src_te.mean():.2f} ± {src_te.std(ddof=ddof):.2f} %\n"
+            f" Tgt-Test : {tgt_te.mean():.2f} ± {tgt_te.std(ddof=ddof):.2f} %   <-- 보고 수치")
+    lines.append(summary)
+    lines.append("=" * width)
 
     text = "\n".join(lines)
     print("\n" + text)

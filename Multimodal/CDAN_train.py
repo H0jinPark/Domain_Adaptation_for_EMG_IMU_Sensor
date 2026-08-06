@@ -24,12 +24,49 @@ from tqdm import tqdm
 # 프로젝트 루트를 import 경로에 추가 (Multimodal/ → ../)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(PROJECT_ROOT)
-from mm_data_loader import get_mm_dataloaders
+from mm_data_loader import get_mm_dataloaders, get_mm_test_loaders
 from mm_model import InterFusionCDAN
 from mm_utils import set_seed, evaluate, save_confusion_matrix, summarize_results
 
 WEIGHT_DIR = os.path.join(PROJECT_ROOT, "weights")
-RESULT_DIR = os.path.join(PROJECT_ROOT, "results")
+# 멀티모달 결과는 results/Multimodal/ 로 분리 저장한다(IMU 단독은 results/IMU/).
+# 과거엔 results/ 루트에 쓰고 손으로 옮겼는데, 스윕이 자동으로 제자리에 쓰도록 고정.
+RESULT_DIR = os.path.join(PROJECT_ROOT, "results", "Multimodal")
+
+# 백본 변형 — orig(Multimodal/mm_model) | compact(Compact/compact_model).
+# 두 모듈은 클래스 이름·forward 시그니처·출력 차원이 같아서 클래스만 갈아끼우면 된다.
+# 경량 백본의 산출물(결과 JSON·체크포인트·CM)은 원본과 섞이지 않게 Compact/Result/ 아래로 보낸다.
+BACKBONE = "orig"
+MODEL_CLS = InterFusionCDAN
+# 모델 생성자에 넘길 추가 인자 (예: CDAN-RP). compact 백본에서만 지원한다.
+MODEL_KW = {}
+
+
+def select_result_subdir(name):
+    """결과/체크포인트를 results/<name>/ 로 돌린다 (예: SubjectSplit).
+
+    분할 규약이 다른 실험(피험자 단위 등)의 산출물이 기존 멀티모달 결과와
+    같은 폴더에서 섞이지 않게 하기 위한 것이다. 체크포인트도 같이 분리한다.
+    """
+    global RESULT_DIR, WEIGHT_DIR
+    if not name:
+        return
+    RESULT_DIR = os.path.join(PROJECT_ROOT, "results", name)
+    WEIGHT_DIR = os.path.join(PROJECT_ROOT, "results", name, "weights")
+
+
+def select_backbone(name):
+    """백본 변형을 고르고 결과/체크포인트 저장 위치를 그에 맞게 바꾼다."""
+    global BACKBONE, MODEL_CLS, RESULT_DIR, WEIGHT_DIR
+    if name == "orig":
+        return
+    if name != "compact":
+        raise ValueError(f"알 수 없는 backbone: {name!r} (orig|compact 중 하나)")
+    from Compact.compact_model import InterFusionCDAN as CompactCDAN
+    BACKBONE = "compact"
+    MODEL_CLS = CompactCDAN
+    RESULT_DIR = os.path.join(PROJECT_ROOT, "Compact", "Result", "Multimodal")
+    WEIGHT_DIR = os.path.join(PROJECT_ROOT, "Compact", "Result", "weights")
 
 
 # ----------------------------------------------------------------------
@@ -49,7 +86,7 @@ def train_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3, domain_weight=1.0, sa
         get_mm_dataloaders(batch_size=batch_size)
     class_names = le.classes_
 
-    model = InterFusionCDAN(num_classes=num_classes).to(device)
+    model = MODEL_CLS(num_classes=num_classes, **MODEL_KW).to(device)
 
     criterion_class = nn.CrossEntropyLoss(label_smoothing=0.1)
     criterion_domain = nn.CrossEntropyLoss()
@@ -138,52 +175,87 @@ def train_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3, domain_weight=1.0, sa
               f"Alpha: {alpha:.3f}"
               f"{'  (best)' if is_best else ''}")
 
-    print(f"\n최종 결과 | seed={seed} | "
-          f"Best Source Val Acc: {best_val_acc:.2f}% | "
-          f"Target Acc at Best Source: {best_target_acc:.2f}% | "
+    print(f"\n[val] seed={seed} | Best Source Val: {best_val_acc:.2f}% | "
+          f"Target Val at best: {best_target_acc:.2f}% | "
           f"Shift: {best_val_acc - best_target_acc:.2f}%")
 
+    # ---- 최종 test 평가 (학습 종료 후 1회) -------------------------------
+    # 여기서 처음으로 test 를 로드한다. 위 학습 루프는 test 로더 자체를 갖고 있지
+    # 않으므로 model selection 에 test 가 개입할 여지가 없다.
+    model.load_state_dict(torch.load(save_path, map_location=device))
+    test_loader, tgt_test_loader = get_mm_test_loaders(le, batch_size=batch_size)
+    src_test_acc, v_preds, v_true = evaluate(model, test_loader, device, needs_alpha=True)
+    tgt_test_acc, t_preds, t_true = evaluate(model, tgt_test_loader, device, needs_alpha=True)
+    print(f"[test] seed={seed} | Source Test: {src_test_acc:.2f}% | "
+          f"Target Test: {tgt_test_acc:.2f}% | "
+          f"Shift: {src_test_acc - tgt_test_acc:.2f}%   <-- 보고 수치")
+
     if save_cm:
-        model.load_state_dict(torch.load(save_path, map_location=device))
-        _, v_preds, v_true = evaluate(model, val_loader, device, needs_alpha=True)
-        _, t_preds, t_true = evaluate(model, tgt_val_loader, device, needs_alpha=True)
+        # 혼동 행렬도 보고 수치와 같은 test 기준으로 그린다.
         save_confusion_matrix(
             v_true, v_preds, class_names,
-            os.path.join(RESULT_DIR, f"mm_cdan{suffix}_seed{seed}_source_cm.png"),
-            f"CDAN MM Source (seed={seed}, Val Acc: {best_val_acc:.1f}%)", cmap="Purples")
+            os.path.join(RESULT_DIR, f"mm_cdan{suffix}_seed{seed}_source_test_cm.png"),
+            f"CDAN MM Source TEST (seed={seed}, Acc: {src_test_acc:.1f}%)", cmap="Purples")
         save_confusion_matrix(
             t_true, t_preds, class_names,
-            os.path.join(RESULT_DIR, f"mm_cdan{suffix}_seed{seed}_target_cm.png"),
-            f"CDAN MM Target (seed={seed}, Src: {best_val_acc:.1f}% vs Tgt: {best_target_acc:.1f}%)",
+            os.path.join(RESULT_DIR, f"mm_cdan{suffix}_seed{seed}_target_test_cm.png"),
+            f"CDAN MM Target TEST (seed={seed}, Src: {src_test_acc:.1f}% vs Tgt: {tgt_test_acc:.1f}%)",
             cmap="Purples")
-        print("혼동 행렬 시각화 저장 완료.")
+        print("혼동 행렬 시각화 저장 완료 (test 기준).")
 
     return {
         "seed": seed,
         "source_acc": best_val_acc,
         "target_acc": best_target_acc,
         "shift": best_val_acc - best_target_acc,
+        "source_test_acc": src_test_acc,
+        "target_test_acc": tgt_test_acc,
+        "test_shift": src_test_acc - tgt_test_acc,
     }
 
 
 # ----------------------------------------------------------------------
 # 결과 JSON 저장 (메서드 비교용 기계가독 출력)
 # ----------------------------------------------------------------------
+
+def _split_provenance():
+    """데이터 폴더의 split_manifest.json 에서 분할 규약을 읽어 결과 json 에 남긴다."""
+    d = os.environ.get("MM_DATA_DIR", "preprocessed_MM_raw")
+    mf = os.path.join(PROJECT_ROOT, d, "split_manifest.json")
+    if not os.path.isfile(mf):
+        return {}
+    try:
+        with open(mf, encoding="utf-8") as f:
+            m = json.load(f)
+    except Exception:
+        return {}
+    out = {"split_by": m.get("split_by", "session")}
+    for k in ("val_subjects", "test_subjects"):
+        if m.get(k) is not None:
+            out[k] = m[k]
+    return out
+
 def write_result_json(results, tag):
     """seed별 결과 리스트를 평균/표준편차와 함께 results/cdan_result_<tag>.json 로 저장."""
-    src = [r["source_acc"] for r in results]
-    tgt = [r["target_acc"] for r in results]
-    sh  = [r["shift"] for r in results]
     ddof = 1 if len(results) > 1 else 0
+    keys = ["source_acc", "target_acc", "shift",
+            "source_test_acc", "target_test_acc", "test_shift"]
+    cols = {k: [r[k] for r in results] for k in keys if k in results[0]}
     payload = {
         "tag": tag or "default",
+        "modality": "multimodal",
+        "backbone": BACKBONE,
+        "cdan_rp": bool(MODEL_KW.get("cdan_rp", False)),
+        **({"compact": __import__("Compact.compact_model", fromlist=["x"]).variant_info()}
+           if BACKBONE == "compact" else {}),
         "data_dir": os.environ.get("MM_DATA_DIR", "preprocessed_MM_raw"),
+        **_split_provenance(),
+        "selection": "target_val (oracle)",   # model selection 기준 — 보고 시 명시할 것
+        "reported_metric": "target_test_acc",
         "seeds": [r["seed"] for r in results],
         "results": results,
-        "mean": {"source_acc": float(np.mean(src)), "target_acc": float(np.mean(tgt)),
-                 "shift": float(np.mean(sh))},
-        "std":  {"source_acc": float(np.std(src, ddof=ddof)), "target_acc": float(np.std(tgt, ddof=ddof)),
-                 "shift": float(np.std(sh, ddof=ddof))},
+        "mean": {k: float(np.mean(v)) for k, v in cols.items()},
+        "std":  {k: float(np.std(v, ddof=ddof)) for k, v in cols.items()},
     }
     path = os.path.join(RESULT_DIR, f"cdan_result_{tag or 'default'}.json")
     os.makedirs(RESULT_DIR, exist_ok=True)
@@ -206,6 +278,15 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--domain_weight", type=float, default=1.0)
     parser.add_argument("--no_cm", action="store_true")
+    parser.add_argument("--cdan_rp", action="store_true",
+                        help="CDAN 조건부 판별기 입력을 feature x class-prob 외적(5120) 대신 "
+                             "원논문의 랜덤 multilinear map(1024)으로. --backbone compact 에서만 지원.")
+    parser.add_argument("--backbone", choices=["orig", "compact"], default="orig",
+                        help="백본 변형. compact 는 TCN 블록을 줄인 Compact/compact_model 을 쓰고 "
+                             "결과를 Compact/Result/ 아래에 저장한다.")
+    parser.add_argument("--result_subdir", type=str, default="",
+                        help="결과를 results/<이 값>/ 아래에 저장한다(체크포인트도 분리). "
+                             "분할 규약이 다른 실험을 기존 결과와 섞지 않기 위한 것.")
     parser.add_argument("--tag", type=str, default="",
                         help="출력 파일 태그(예: 축정렬 메서드 raw/pca/gravity/permutation/kabsch). "
                              "weight·CM·결과 JSON 파일명에 반영되어 메서드별로 분리 저장된다.")
@@ -214,6 +295,13 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    select_backbone(args.backbone)
+    select_result_subdir(args.result_subdir)
+    if args.cdan_rp:
+        if args.backbone != "compact":
+            raise SystemExit("--cdan_rp 는 --backbone compact 에서만 쓸 수 있다 "
+                             "(원본 mm_model 에는 RP 구현이 없다).")
+        MODEL_KW["cdan_rp"] = True
 
     suffix = f"_{args.tag}" if args.tag else ""
     if args.multi_seed:
