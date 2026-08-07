@@ -46,9 +46,13 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from mm_data_loader import get_mm_dataloaders, get_mm_test_loaders   # noqa: E402
 from mm_utils import set_seed, evaluate, save_confusion_matrix, \
     summarize_results                                                # noqa: E402
-from physics_model import PhysicsInformedCDAN                        # noqa: E402
+from physics_model import PhysicsInformedCDAN, fusion_info           # noqa: E402
 from physics_losses import imu_reconstruction_loss, imu_jerk_loss, \
-    physics_diagnostics                                              # noqa: E402
+    imu_orientation_loss, imu_axes_loss, physics_diagnostics, \
+    gravity_magnitude                                                # noqa: E402
+
+# isotropic 판정 임계 — 실측 중앙값이 z-score 0.437 / isotropic 0.932 로 갈려서 중간에 둔다.
+GRAVITY_MIN = 0.70
 
 WEIGHT_DIR = os.path.join(PROJECT_ROOT, "weights")
 RESULT_DIR = os.path.join(PROJECT_ROOT, "results", "EMG_physics")
@@ -60,7 +64,9 @@ RESULT_DIR = os.path.join(PROJECT_ROOT, "results", "EMG_physics")
 def train_physics_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3,
                        domain_weight=1.0, lambda_rec=0.0, lambda_jerk=0.0,
                        aux_on_target=True, recon_loss="huber",
-                       decoder_width=128, save_cm=False, tag=""):
+                       decoder_width=128, save_cm=False, tag="",
+                       imu_interp=False, lambda_orient=0.0, lambda_axes=0.0,
+                       skip_isotropic_check=False):
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -74,7 +80,8 @@ def train_physics_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3,
     class_names = le.classes_
 
     model = PhysicsInformedCDAN(num_classes=num_classes,
-                                decoder_width=decoder_width).to(device)
+                                decoder_width=decoder_width,
+                                imu_interp=imu_interp).to(device)
 
     criterion_class = nn.CrossEntropyLoss(label_smoothing=0.1)
     criterion_domain = nn.CrossEntropyLoss()
@@ -85,8 +92,26 @@ def train_physics_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3,
     print("\n" + "=" * 60)
     print(f"Physics-informed CDAN Training Start  |  seed={seed}")
     print(f"lambda_rec={lambda_rec}  lambda_jerk={lambda_jerk}  "
+          f"lambda_orient={lambda_orient}  lambda_axes={lambda_axes}  "
           f"aux_on_target={aux_on_target}  recon={recon_loss}")
+    print(f"fusion: {model.fusion_info()}")
     print(f"Targeting {num_classes} classes on {device}")
+
+    # orient/axes 는 중력 DC 와 축간 크기비가 살아 있어야 의미가 있다. 데이터 이름이 아니라
+    # 첫 배치의 실측값으로 판정한다 — 폴더명 규칙에 의존하면 조용히 틀린 데이터로 돈다.
+    if (lambda_orient > 0 or lambda_axes > 0) and not skip_isotropic_check:
+        probe_imu = next(iter(train_loader))[1]
+        g = gravity_magnitude(probe_imu)
+        print(f"[isotropic 확인] 윈도우 평균가속도 크기 중앙값 = {g:.3f} "
+              f"(임계 {GRAVITY_MIN}, isotropic ≈0.93 / 축별 z-score ≈0.44)")
+        if g < GRAVITY_MIN:
+            raise SystemExit(
+                f"중력 DC 가 없는 데이터다 (측정 {g:.3f} < {GRAVITY_MIN}). "
+                f"MM_DATA_DIR={os.environ.get('MM_DATA_DIR', 'preprocessed_MM_raw')} 는 "
+                f"축별 z-score 판으로 보인다 — orient/axes 손실이 무의미하다.\n"
+                f"  해결: MM_DATA_DIR=preprocessed_MM_pca_isotropic 로 실행하거나\n"
+                f"        python data_preprocess_MM.py --method pca --imu_norm isotropic 로 생성.\n"
+                f"  의도한 것이라면 --skip_isotropic_check 로 넘길 수 있다.")
     print("=" * 60)
 
     best_val_acc, best_target_acc = 0.0, 0.0
@@ -97,6 +122,7 @@ def train_physics_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3,
         len_loader = min(len(train_loader), len(tgt_train_loader))
         total_c_loss, total_d_loss, total_d_acc = 0.0, 0.0, 0.0
         total_rec, total_jerk = 0.0, 0.0
+        total_orient, total_axes = 0.0, 0.0
         diag_acc, diag_n = {}, 0
 
         # GRL alpha 스케줄 (기존 CDAN 과 동일)
@@ -126,17 +152,30 @@ def train_physics_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3,
 
             # Step 3. 물리 보조 손실 — 라벨 불필요라 target 에도 걸린다.
             #         두 도메인에 걸 때는 평균(합 아님) → λ 의미가 플래그와 무관해진다.
-            rec = imu_reconstruction_loss(src_imu_hat, src_imu, kind=recon_loss)
-            jerk = imu_jerk_loss(src_imu_hat)
-            if aux_on_target:
-                rec = 0.5 * (rec + imu_reconstruction_loss(tgt_imu_hat, tgt_imu, kind=recon_loss))
-                jerk = 0.5 * (jerk + imu_jerk_loss(tgt_imu_hat))
+            #         λ=0 인 항은 아예 계산하지 않는다 — 0 을 곱해 더하면 값은 같아도
+            #         쓸데없는 그래프가 생기고, λ=0 대조군의 "기존 CDAN 과 동일" 이 흐려진다.
+            def _both(fn, s_hat, s_true, t_hat, t_true):
+                v = fn(s_hat, s_true)
+                return 0.5 * (v + fn(t_hat, t_true)) if aux_on_target else v
+
+            zero = torch.zeros((), device=device)
+            rec = (_both(lambda p, t: imu_reconstruction_loss(p, t, kind=recon_loss),
+                         src_imu_hat, src_imu, tgt_imu_hat, tgt_imu)
+                   if lambda_rec > 0 else zero)
+            jerk = ((0.5 * (imu_jerk_loss(src_imu_hat) + imu_jerk_loss(tgt_imu_hat))
+                     if aux_on_target else imu_jerk_loss(src_imu_hat))
+                    if lambda_jerk > 0 else zero)
+            orient = (_both(imu_orientation_loss, src_imu_hat, src_imu, tgt_imu_hat, tgt_imu)
+                      if lambda_orient > 0 else zero)
+            axes = (_both(imu_axes_loss, src_imu_hat, src_imu, tgt_imu_hat, tgt_imu)
+                    if lambda_axes > 0 else zero)
 
             # Step 4. 통합 손실
             class_loss = loss_s_label
             domain_loss = loss_s_domain + loss_t_domain
             loss = (class_loss + domain_weight * domain_loss
-                    + lambda_rec * rec + lambda_jerk * jerk)
+                    + lambda_rec * rec + lambda_jerk * jerk
+                    + lambda_orient * orient + lambda_axes * axes)
 
             loss.backward()
             optimizer.step()
@@ -151,6 +190,8 @@ def train_physics_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3,
             total_d_acc += domain_acc
             total_rec += float(rec.item())
             total_jerk += float(jerk.item())
+            total_orient += float(orient.item())
+            total_axes += float(axes.item())
 
             # 진단은 매 배치 돌릴 필요 없다 (상관계산이 싸지 않다)
             if i % 20 == 0:
@@ -165,6 +206,8 @@ def train_physics_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3,
                 "Domain": f"{domain_loss.item():.4f}",
                 "Rec": f"{rec.item():.4f}",
                 "Jerk": f"{jerk.item():.4f}",
+                "Ori": f"{orient.item():.4f}",
+                "Axe": f"{axes.item():.4f}",
             })
 
         scheduler.step()
@@ -185,8 +228,11 @@ def train_physics_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3,
               f"Domain: {total_d_loss/len_loader:.4f} | "
               f"DomAcc: {total_d_acc/len_loader*100:.2f}% | "
               f"Rec: {total_rec/len_loader:.4f} | Jerk: {total_jerk/len_loader:.4f} | "
+              f"Ori: {total_orient/len_loader:.4f} | Axe: {total_axes/len_loader:.4f} | "
               f"corr: {dg.get('recon_corr', 0):.3f} | "
               f"jerkR: {dg.get('jerk_ratio', 0):.3f} | "
+              f"ori°: {dg.get('orient_deg', 0):.1f} | "
+              f"axe°: {dg.get('axis_deg', 0):.1f} | "
               f"Source Val: {val_acc:.2f}% | Target Val: {tgt_acc:.2f}%"
               f"{'  (best)' if is_best else ''}")
 
@@ -203,16 +249,22 @@ def train_physics_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3,
           f"Target Test: {tgt_test_acc:.2f}% | "
           f"Shift: {src_test_acc - tgt_test_acc:.2f}%   <-- 보고 수치")
 
-    # 최종 재구성 품질 (target test 기준) — 물리 손실이 실제로 뭘 배웠는지 남긴다
+    # 최종 재구성 품질 (target test **전체**) — 물리 손실이 실제로 뭘 배웠는지 남긴다.
+    # 배치 하나로 재면 표본이 작아 seed 간 비교(r(진단, 정확도))가 잡음에 묻힌다.
     model.eval()
+    acc_diag, nb = {}, 0
     with torch.no_grad():
-        emg_b, imu_b, _ = next(iter(tgt_test_loader))
-        _, _, hat_b = model(emg_b.to(device), imu_b.to(device), alpha=0.0)
-        final_diag = physics_diagnostics(hat_b, imu_b.to(device))
-    print(f"[recon] target test | corr={final_diag['recon_corr']:.3f} "
-          f"jerk_pred={final_diag['jerk_rms_pred']:.2f} "
-          f"jerk_true={final_diag['jerk_rms_true']:.2f} "
-          f"ratio={final_diag['jerk_ratio']:.3f}")
+        for emg_b, imu_b, _ in tgt_test_loader:
+            imu_b = imu_b.to(device)
+            _, _, hat_b = model(emg_b.to(device), imu_b, alpha=0.0)
+            for k, v in physics_diagnostics(hat_b, imu_b).items():
+                acc_diag[k] = acc_diag.get(k, 0.0) + v
+            nb += 1
+    final_diag = {k: v / max(nb, 1) for k, v in acc_diag.items()}
+    print(f"[recon] target test 전체({nb}배치) | corr={final_diag['recon_corr']:.3f} "
+          f"jerk_ratio={final_diag['jerk_ratio']:.3f} | "
+          f"중력방향오차={final_diag['orient_deg']:.1f}° "
+          f"주축오차={final_diag['axis_deg']:.1f}°  (무작위 기준선 90°)")
 
     if save_cm:
         save_confusion_matrix(
@@ -241,13 +293,14 @@ def train_physics_cdan(seed=42, epochs=30, batch_size=64, lr=1e-3,
 # ----------------------------------------------------------------------
 # λ 규모 프로브 — 학습 전에 각 항의 크기를 재서 λ 를 감으로 고르지 않게 한다
 # ----------------------------------------------------------------------
-def probe(batch_size=64, decoder_width=128, recon_loss="huber"):
+def probe(batch_size=64, decoder_width=128, recon_loss="huber", imu_interp=False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_seed(0)
     train_loader, _, tgt_train_loader, _, num_classes, _ = \
         get_mm_dataloaders(batch_size=batch_size)
     model = PhysicsInformedCDAN(num_classes=num_classes,
-                                decoder_width=decoder_width).to(device)
+                                decoder_width=decoder_width,
+                                imu_interp=imu_interp).to(device)
     model.train()
     criterion_class = nn.CrossEntropyLoss(label_smoothing=0.1)
     criterion_domain = nn.CrossEntropyLoss()
@@ -266,9 +319,12 @@ def probe(batch_size=64, decoder_width=128, recon_loss="huber"):
         r = 0.5 * (imu_reconstruction_loss(sh, si, kind=recon_loss)
                    + imu_reconstruction_loss(th, ti, kind=recon_loss)).item()
         j = 0.5 * (imu_jerk_loss(sh) + imu_jerk_loss(th)).item()
+        o = 0.5 * (imu_orientation_loss(sh, si) + imu_orientation_loss(th, ti)).item()
+        a = 0.5 * (imu_axes_loss(sh, si) + imu_axes_loss(th, ti)).item()
         dg = physics_diagnostics(th, ti)
         # 참고: 정답 IMU 자체의 항 크기 (디코더가 완벽할 때의 하한/기준)
         j_true = imu_jerk_loss(ti).item()
+        g_src, g_tgt = gravity_magnitude(si), gravity_magnitude(ti)
 
     print("\n" + "=" * 66)
     print(" λ 규모 프로브 — 초기화 직후 1배치, 각 손실 항의 크기")
@@ -278,16 +334,29 @@ def probe(batch_size=64, decoder_width=128, recon_loss="huber"):
     print(f"  L_rec    ({recon_loss:5s})              = {r:.4f}")
     print(f"  L_jerk   (예측)                = {j:.6f}")
     print(f"  L_jerk   (정답 IMU 기준값)      = {j_true:.6f}")
+    print(f"  L_orient (1-cos, 범위 0~2)     = {o:.4f}   (무작위 방향이면 ≈1.0)")
+    print(f"  L_axes   (상대 Frobenius²)     = {a:.4f}   (완전 불일치면 ≈1 이상)")
     print(f"  진단: recon_corr={dg['recon_corr']:.3f}  "
           f"jerk_rms pred={dg['jerk_rms_pred']:.2f} true={dg['jerk_rms_true']:.2f}")
+    print(f"        중력방향오차 {dg['orient_deg']:.1f}°  주축오차 {dg['axis_deg']:.1f}°  "
+          f"(무작위 기준선 90°)")
+    print(f"  데이터: 윈도우 평균가속도 크기 중앙값 src={g_src:.3f} tgt={g_tgt:.3f}  "
+          f"(isotropic ≈0.93 / 축별 z-score ≈0.44, 임계 {GRAVITY_MIN})")
     print("\n  λ 고르는 법 — 보조항이 분류 손실의 대략 5~30% 기여가 되게 잡는다:")
     for frac in (0.05, 0.1, 0.3):
         print(f"    기여 {frac*100:>4.0f}% :  λ_rec ≈ {frac*c/max(r,1e-12):>8.3f}"
-              f"     λ_jerk ≈ {frac*c/max(j,1e-12):>10.3f}")
+              f"   λ_jerk ≈ {frac*c/max(j,1e-12):>8.3f}"
+              f"   λ_orient ≈ {frac*c/max(o,1e-12):>7.3f}"
+              f"   λ_axes ≈ {frac*c/max(a,1e-12):>7.4f}")
     print("\n  주의 — 초기화 직후 값이라 학습이 진행되면 L_rec 은 내려가고 L_class 도")
     print("  내려간다. 위 값은 출발점의 자릿수를 잡는 용도이지 최적 λ 가 아니다.")
     print("  L_jerk 가 정답 기준값보다 훨씬 크면 디코더가 아직 잡음을 뱉는 중이고,")
     print("  학습 후에도 ratio 가 1 을 크게 밑돌면 λ_jerk 과평활이다.")
+    print("  **λ_axes 는 특히 이 표를 믿지 말 것** — L_axes 는 참 공분산으로 나눈 상대량이라")
+    print("  학습 안 된 디코더의 과대 출력(jerk_rms 비 수십 배)에 그대로 부풀어 있다.")
+    print("  디코더 스케일이 잡히면 급락하므로, λ_orient 와 비슷한 기여가 되도록")
+    print("  1~2 에폭 돌려보고 실측 L_axes 로 다시 잡는 편이 맞다.")
+    print("  L_orient 는 1-cos 라 [0,2] 로 유계이고 무작위 방향이 ≈1 이므로 표를 믿어도 된다.")
     print("=" * 66)
 
 
@@ -320,7 +389,8 @@ def write_result_json(results, tag, cfg):
     ddof = 1 if len(results) > 1 else 0
     keys = ["source_acc", "target_acc", "shift",
             "source_test_acc", "target_test_acc", "test_shift",
-            "final_recon_corr", "final_jerk_ratio"]
+            "final_recon_corr", "final_jerk_ratio",
+            "final_orient_deg", "final_axis_deg"]
     cols = {k: [r[k] for r in results] for k in keys if k in results[0]}
     payload = {
         "tag": tag or "default",
@@ -357,12 +427,28 @@ def parse_args():
                    help="IMU 재구성 손실 가중치. 0 이면 기존 CDAN 과 동일한 대조군.")
     p.add_argument("--lambda_jerk", type=float, default=0.0,
                    help="jerk 최소화 손실 가중치. 0 이면 물리 prior 없음.")
+    p.add_argument("--lambda_orient", type=float, default=0.0,
+                   help="중력방향 정합 손실 가중치 — 복원 IMU 의 시간평균 방향을 참 IMU 와 "
+                        "맞춘다(윈도우당 3 dof). isotropic 데이터 전용. "
+                        "이름이 Learnable_R 의 --lambda_g 와 다른 것은 의도한 것으로, "
+                        "그쪽은 R 을 학습시키는 항이고 이쪽은 디코더 출력에 거는 항이다.")
+    p.add_argument("--lambda_axes", type=float, default=0.0,
+                   help="주축 구조 정합 손실 가중치 — 복원 IMU 의 움직임 공분산(3x3)을 참 IMU 와 "
+                        "맞춘다(윈도우당 6 dof). 고유벡터를 직접 비교하지 않아 부호 모호와 "
+                        "축퇴에 안전하다. Learnable_R 의 --lambda_pca 와는 다른 항이다.")
+    p.add_argument("--skip_isotropic_check", action="store_true",
+                   help="orient/axes 를 켤 때 첫 배치로 중력 DC 존재를 확인하는 검사를 건너뛴다.")
     p.add_argument("--no_aux_on_target", action="store_true",
                    help="보조 손실을 source 에만 건다(기본은 두 도메인 모두). "
                         "두 손실 다 라벨이 필요 없어 target 에도 걸 수 있는데, "
                         "그 기여를 분리하려면 이 플래그로 끈다.")
     p.add_argument("--recon_loss", default="huber", choices=["huber", "mse", "l1"])
     p.add_argument("--decoder_width", type=int, default=128)
+    p.add_argument("--imu_interp", action="store_true",
+                   help="옛 동작 복원 — IMU 인코더가 길이를 10배 줄이고(stride 5 + MaxPool2) "
+                        "F.interpolate 로 500 까지 되돌려 concat 한다. 기본은 길이 보존 "
+                        "인코더(stride 1, MaxPool 제거)로 보간 없이 concat. "
+                        "2026-08-04 스윕은 전부 이 플래그 켠 판이므로 섞어 비교하지 말 것.")
     p.add_argument("--no_cm", action="store_true")
     p.add_argument("--tag", type=str, default="")
     p.add_argument("--probe", action="store_true",
@@ -375,7 +461,7 @@ if __name__ == "__main__":
 
     if args.probe:
         probe(batch_size=args.batch_size, decoder_width=args.decoder_width,
-              recon_loss=args.recon_loss)
+              recon_loss=args.recon_loss, imu_interp=args.imu_interp)
         sys.exit(0)
 
     aux_on_target = not args.no_aux_on_target
@@ -383,14 +469,19 @@ if __name__ == "__main__":
         "epochs": args.epochs, "batch_size": args.batch_size, "lr": args.lr,
         "domain_weight": args.domain_weight,
         "lambda_rec": args.lambda_rec, "lambda_jerk": args.lambda_jerk,
+        "lambda_orient": args.lambda_orient, "lambda_axes": args.lambda_axes,
         "aux_on_target": aux_on_target, "recon_loss": args.recon_loss,
         "decoder_width": args.decoder_width,
+        # 융합단 구성 — 08-04 판(interp)과 새 판(nointerp)을 구분하는 결정적 필드
+        **fusion_info(args.imu_interp),
     }
     kw = dict(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
               domain_weight=args.domain_weight, lambda_rec=args.lambda_rec,
               lambda_jerk=args.lambda_jerk, aux_on_target=aux_on_target,
               recon_loss=args.recon_loss, decoder_width=args.decoder_width,
-              save_cm=not args.no_cm, tag=args.tag)
+              save_cm=not args.no_cm, tag=args.tag, imu_interp=args.imu_interp,
+              lambda_orient=args.lambda_orient, lambda_axes=args.lambda_axes,
+              skip_isotropic_check=args.skip_isotropic_check)
 
     suffix = f"_{args.tag}" if args.tag else ""
     if args.multi_seed:
